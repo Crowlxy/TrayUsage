@@ -23,7 +23,7 @@ internal enum IslandTheme { Classic, Pill }
 internal sealed class UsageIsland : IDisposable
 {
     private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f, ContentDrop = 2;
-    private const double GrowDelay = 0.03, ShrinkDelay = 0.05, FadeOutDelay = 0.25;
+    private const double GrowDelay = 0.03, ShrinkDelay = 0.05, FadeOutDelay = 0.15, VanishFloor = 0.1;
     private readonly IslandStyle _style = new();
     private readonly PanelSurface _panel;
     private readonly Stopwatch _clock = new();
@@ -422,7 +422,7 @@ internal sealed class UsageIsland : IDisposable
     {
         _contentBitmap?.Dispose();
         _contentBitmap = null;
-        if (_pacer is null && Visible && _shown) Present(releaseCanvas: true);
+        if (_pacer is null && Visible && _shown) Present(releaseCanvas: !KeepCanvas);
     }
 
     private void StartFrames()
@@ -474,7 +474,8 @@ internal sealed class UsageIsland : IDisposable
         }
         if (_fadeOutArm > 0)
         {
-            var landed = !_shown && _h.Value <= PillHeight + 8 && _w.Value <= PillWidth + 24;
+            // Dissolve while the last of the shrink is still running: waiting for the exact pill size leaves a full-size grey pill lingering.
+            var landed = !_shown && _h.Value <= PillHeight + 24 && _w.Value <= PillWidth + 90;
             if (landed || (_fadeOutArm -= elapsed) <= 0)
             {
                 _fadeOutArm = 0;
@@ -482,7 +483,7 @@ internal sealed class UsageIsland : IDisposable
             }
         }
 
-        if (!_shown && _fadeOutArm <= 0 && _presence.Target == 0 && _presence.Value < 0.004)
+        if (!_shown && _fadeOutArm <= 0 && _presence.Target == 0 && _presence.Value < VanishFloor)
         {
             StopFrames();
             HideNow();
@@ -506,7 +507,7 @@ internal sealed class UsageIsland : IDisposable
             _contentBitmap?.Dispose();
             _contentBitmap = null;
         }
-        Present(releaseCanvas: settled);
+        Present(releaseCanvas: settled && !KeepCanvas);
         if (settled) StopFrames();
     }
 
@@ -518,6 +519,9 @@ internal sealed class UsageIsland : IDisposable
         _ghostBitmap?.Dispose();
         _ghostBitmap = null;
     }
+
+    /// <summary>While a panel or card is up its canvas stays: reallocating it for the closing frames costs the first frames of the close.</summary>
+    private bool KeepCanvas => _shown && _surface is not NoticeSurface;
 
     private void Present(bool releaseCanvas)
     {
@@ -547,6 +551,8 @@ internal sealed class UsageIsland : IDisposable
         g.Clear(Color.Transparent);
         g.CompositingMode = CompositingMode.SourceOver;
         var presence = (float)Math.Clamp(_presence.Value, 0, 1);
+        // The spring's tail would leave a ghost at a few percent for a dozen frames; closing, the fade ends at VanishFloor instead.
+        if (_presence.Target == 0) presence = (float)Math.Clamp((presence - VanishFloor) / (1 - VanishFloor), 0, 1);
         if (presence <= 0.004f || _surface is null)
         {
             _bodyPx = RectangleF.Empty;
