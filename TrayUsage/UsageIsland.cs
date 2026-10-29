@@ -23,7 +23,7 @@ internal enum IslandTheme { Classic, Pill }
 internal sealed class UsageIsland : IDisposable
 {
     private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f, ContentDrop = 2;
-    private const double GrowDelay = 0.03, ShrinkDelay = 0.05, FadeOutDelay = 0.15, VanishFloor = 0.1;
+    private const double GrowDelay = 0.03, ShrinkDelay = 0.05, RetractDelay = 0.15;
     private readonly IslandStyle _style = new();
     private readonly PanelSurface _panel;
     private readonly Stopwatch _clock = new();
@@ -80,6 +80,9 @@ internal sealed class UsageIsland : IDisposable
 
     private bool Docked => _theme != IslandTheme.Pill;
     private float RestTop => Docked ? 0 : TopGap;
+
+    /// <summary>Where the closing pill slides to: past the point where its shadow clears the screen edge, so the spring crosses it instead of crawling in.</summary>
+    private const float RetractTop = -(PillHeight + Shadow.Drop + Shadow.Reach + 24);
 
     public IslandTheme Theme
     {
@@ -238,14 +241,14 @@ internal sealed class UsageIsland : IDisposable
         _glowTime = -1; // a pulse in flight would outlive the body as a halo
         _top.Retarget(0, Motion.Top, Motion.Top);
         // Closing, the card gathers into the pill: the content shrinks with the body and fades slowly,
-        // then the pill itself dissolves once it has landed (see Step).
+        // then the pill tucks up into the screen edge once it has landed (see Step).
         _pageSwitch = false;
         _glowRest = 0;
         if (!(_animate && ToGhost(Motion.Fade))) _contentAlpha.Retarget(0, Motion.Fade, Motion.Fade);
         _lift.Retarget(0, Motion.Top, Motion.Top);
         _contentArm = 0;
         _meterArmed = false;
-        _fadeOutArm = FadeOutDelay;
+        _fadeOutArm = RetractDelay;
         SetInteractive(false);
         if (!_animate)
         {
@@ -474,16 +477,17 @@ internal sealed class UsageIsland : IDisposable
         }
         if (_fadeOutArm > 0)
         {
-            // Dissolve while the last of the shrink is still running: waiting for the exact pill size leaves a full-size grey pill lingering.
+            // Tuck away while the last of the shrink is still running, so no full-size pill waits at the edge.
             var landed = !_shown && _h.Value <= PillHeight + 24 && _w.Value <= PillWidth + 90;
             if (landed || (_fadeOutArm -= elapsed) <= 0)
             {
                 _fadeOutArm = 0;
-                _presence.Retarget(0, Motion.Vanish, Motion.Vanish);
+                _top.Retarget(RetractTop, Motion.Retract, Motion.Retract);
             }
         }
 
-        if (!_shown && _fadeOutArm <= 0 && _presence.Target == 0 && _presence.Value < VanishFloor)
+        // Retracting: the pill (and its shadow) has slid fully above the screen edge.
+        if (!_shown && _fadeOutArm <= 0 && _top.Target < 0 && _top.Value <= -(_h.Value + Shadow.Drop + Shadow.Reach))
         {
             StopFrames();
             HideNow();
@@ -551,8 +555,6 @@ internal sealed class UsageIsland : IDisposable
         g.Clear(Color.Transparent);
         g.CompositingMode = CompositingMode.SourceOver;
         var presence = (float)Math.Clamp(_presence.Value, 0, 1);
-        // The spring's tail would leave a ghost at a few percent for a dozen frames; closing, the fade ends at VanishFloor instead.
-        if (_presence.Target == 0) presence = (float)Math.Clamp((presence - VanishFloor) / (1 - VanishFloor), 0, 1);
         if (presence <= 0.004f || _surface is null)
         {
             _bodyPx = RectangleF.Empty;
