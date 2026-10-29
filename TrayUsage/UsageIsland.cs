@@ -23,7 +23,7 @@ internal enum IslandTheme { Classic, Pill }
 internal sealed class UsageIsland : IDisposable
 {
     private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f, ContentDrop = 2;
-    private const double GrowDelay = 0.03, ShrinkDelay = 0.05, RetractDelay = 0.15;
+    private const double GrowDelay = 0.03, ShrinkDelay = 0.05;
     private readonly IslandStyle _style = new();
     private readonly PanelSurface _panel;
     private readonly Stopwatch _clock = new();
@@ -52,7 +52,7 @@ internal sealed class UsageIsland : IDisposable
     private Point _origin;
     private float _scale = 1;
     private bool _shown, _fineTimer, _meterArmed;
-    private double _lastTick, _contentArm, _fadeOutArm;
+    private double _lastTick, _contentArm;
     private RectangleF _bodyPx;
     private PointF _contentOrigin;
     private int _wheel;
@@ -239,16 +239,15 @@ internal sealed class UsageIsland : IDisposable
         _h.Retarget(PillHeight, Motion.Smooth, Motion.Smooth);
         _r.Retarget(PillHeight / 2, Motion.Smooth, Motion.Smooth);
         _glowTime = -1; // a pulse in flight would outlive the body as a halo
-        _top.Retarget(0, Motion.Top, Motion.Top);
-        // Closing, the card gathers into the pill: the content shrinks with the body and fades slowly,
-        // then the pill tucks up into the screen edge once it has landed (see Step).
+        // Closing, the card gathers into the pill as it rises into the screen edge: the content shrinks with the body and
+        // fades slowly, and the island is gone once it has cleared the edge (see Step).
+        _top.Retarget(RetractTop, Motion.Smooth, Motion.Smooth);
         _pageSwitch = false;
         _glowRest = 0;
         if (!(_animate && ToGhost(Motion.Fade))) _contentAlpha.Retarget(0, Motion.Fade, Motion.Fade);
         _lift.Retarget(0, Motion.Top, Motion.Top);
         _contentArm = 0;
         _meterArmed = false;
-        _fadeOutArm = RetractDelay;
         SetInteractive(false);
         if (!_animate)
         {
@@ -305,7 +304,6 @@ internal sealed class UsageIsland : IDisposable
         _shown = true;
         UpdateSpin();
         SetGlow(surface, pulse: previous != surface && surface is NoticeSurface);
-        _fadeOutArm = 0;
         var morph = wasVisible ? Motion.Snappy : Motion.Bouncy; // opening bounces, morphing between surfaces is snappy
         _w.Retarget(size.Width, morph, morph);
         _h.Retarget(size.Height, morph, morph);
@@ -475,25 +473,14 @@ internal sealed class UsageIsland : IDisposable
             if (_meterArmed) _meter.Aim(1, Motion.Meter);
             _meterArmed = false;
         }
-        if (_fadeOutArm > 0)
-        {
-            // Tuck away while the last of the shrink is still running, so no full-size pill waits at the edge.
-            var landed = !_shown && _h.Value <= PillHeight + 24 && _w.Value <= PillWidth + 90;
-            if (landed || (_fadeOutArm -= elapsed) <= 0)
-            {
-                _fadeOutArm = 0;
-                _top.Retarget(RetractTop, Motion.Retract, Motion.Retract);
-            }
-        }
-
-        // Retracting: the pill (and its shadow) has slid fully above the screen edge.
-        if (!_shown && _fadeOutArm <= 0 && _top.Target < 0 && _top.Value <= -(_h.Value + Shadow.Drop + Shadow.Reach))
+        // Closing: the body (and its shadow) has risen fully above the screen edge.
+        if (!_shown && _top.Target < 0 && _top.Value <= -(_h.Value + Shadow.Drop + Shadow.Reach))
         {
             StopFrames();
             HideNow();
             return;
         }
-        var springsSettled = _contentArm <= 0 && _fadeOutArm <= 0 &&
+        var springsSettled = _contentArm <= 0 &&
             !_meterArmed && _glowTime < 0 &&
             new[] { _w, _h, _r, _top, _lift, _tabX, _tabW, _gear }.All(s => s.Settled(0.02, 0.2)) &&
             new[] { _contentAlpha, _ghostAlpha, _presence, _meter }.All(s => s.Settled(0.002, 0.02)) &&
