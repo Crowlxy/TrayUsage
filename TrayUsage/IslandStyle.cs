@@ -132,6 +132,27 @@ internal sealed class IslandStyle : IDisposable
         g.DrawString(text, font, brush, new RectangleF(x, top, width, height), format);
     }
 
+    /// <summary>A row of options in one well; the selected one is lifted. <paramref name="hover"/> is the option under the pointer, or -1.</summary>
+    public void Segments(Graphics g, RectangleF[] controls, string[] options, int selected, int hover)
+    {
+        var span = RectangleF.Union(controls[0], controls[^1]);
+        using (var path = ContinuousRect(span, span.Height / 2, 0))
+        using (var well = new SolidBrush(Alpha2))
+            g.FillPath(well, path);
+        for (var option = 0; option < controls.Length; option++)
+        {
+            if (option == selected || option == hover)
+            {
+                using var path = ContinuousRect(RectangleF.Inflate(controls[option], -2, -2), (controls[option].Height - 4) / 2, 0);
+                using var fill = new SolidBrush(option == selected ? Thumb : Alpha2);
+                g.FillPath(fill, path);
+            }
+            var label = options[option];
+            var labelX = controls[option].X + (controls[option].Width - MeasureWidth(label, Caption)) / 2;
+            Text(g, label, Caption, option == selected ? Primary : Secondary, labelX, controls[option].Y + controls[option].Height / 2 + 4);
+        }
+    }
+
     private static float Ascent(Font font)
     {
         var family = font.FontFamily;

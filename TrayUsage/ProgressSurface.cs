@@ -2,35 +2,41 @@ using System.Drawing.Drawing2D;
 
 namespace TrayUsage;
 
-/// <summary>What a point on the card hits: a button, one of the two tabs, or one of the pager dots.</summary>
-internal enum ProgressHit { None, Close, Jump, More, ProgressTab, UsageTab, Dot }
+/// <summary>What a point on the card hits: a button, one of the two tabs, one of the pager dots, or a row of the history list.</summary>
+internal enum ProgressHit { None, Close, Jump, More, Back, ProgressTab, UsageTab, Dot, Row }
 
 /// <summary>
 /// The main menu, and the card a notice opens into: one surface. Header: the session's logo, name, and a dot with the turn's
 /// message in the state's colour (the agent's accent while it works, green when done), buttons (jump to the terminal, close
-/// once a notice's turn is done, and "more" for the Done / History / Settings panel), and the 進捗 / 使用状況 switch.
+/// once a notice's turn is done, and "more" for the settings panel), and the 進捗 / 使用状況 switch.
 /// 進捗: on the left the last few tool calls in the order they were made, each with ▶ while it runs and ✓ once it returned; on
 /// the right a tile with the model's latest words, or 完了 when the turn is over. With several sessions each is a page, with
-/// dots under it. 使用状況: both agents' 5-hour and weekly meters and the pace verdict. The height never changes, so the card
+/// dots under it. With no session running the tab turns into 履歴: the latest finished turns as a list, a click on one opens it as
+/// the card above (with a back button to the list). A turn that finishes under an open card moves it to the list. 使用状況: both agents' 5-hour and weekly meters and the pace verdict. The height never changes, so the card
 /// can be refreshed on every scan without the island resizing.
 /// </summary>
 internal sealed class ProgressSurface : IslandSurface
 {
     public const int ProgressPage = 0, UsagePage = 1;
-    public const float CardWidth = 560, CardHeight = Header + TileTop + Rows * RowHeight + 32;
-    private const float Header = 52, Pad = 16, Gap = 12, RowHeight = 28, TileWidth = 196, TileTop = 8, SegmentHeight = 28, ButtonSize = 24, ButtonGap = 8;
+    public const float CardWidth = 480, CardHeight = Header + TileTop + Rows * RowHeight + 32;
+    private const float Header = 48, Pad = 16, Gap = 12, RowHeight = 28, TileWidth = 176, TileTop = 8, SegmentHeight = 28, ButtonSize = 24, ButtonGap = 8;
     private const float UsageRow = 70, UsageName = 138, DotY = CardHeight - 15;
     private const int Rows = 4;
+    public const int ListRows = 4;
+    private const float ListRowHeight = 36, ListTop = Header + 4, BackSize = 28;
     private static readonly string[] Tabs = ["進捗", "使用状況"];
     private readonly RectangleF[] _segments;
-    private IReadOnlyList<NoticeData> _pages;
+    private IReadOnlyList<NoticeData> _pages, _recent;
+    private NoticeData? _viewed; // the finished turn opened from the list
     private string _signature;
     private ProviderUsage? _claude, _codex;
 
     /// <param name="menu">Opened as the main menu (it leaves with the pointer, or with its timer), not as a notice (which has its own).</param>
-    public ProgressSurface(IslandStyle style, IReadOnlyList<NoticeData> pages, int index, bool menu, int tab)
+    public ProgressSurface(IslandStyle style, IReadOnlyList<NoticeData> pages, int index, bool menu, int tab, IReadOnlyList<NoticeData> recent, NoticeData? viewed)
     {
         _pages = pages;
+        _recent = recent;
+        _viewed = viewed;
         Menu = menu;
         Page = tab;
         PageIndex = Math.Clamp(index, 0, Math.Max(0, pages.Count - 1));
@@ -49,16 +55,25 @@ internal sealed class ProgressSurface : IslandSurface
     public int PageIndex { get; private set; }
     public int PageCount => _pages.Count;
     public ProgressHit Hover { get; set; }
-    public int HoverDot { get; set; } = -1;
+
+    /// <summary>The pager dot or list row under the pointer, or -1.</summary>
+    public int HoverIndex { get; set; } = -1;
+
+    /// <summary>With no session running and no finished turn opened, the progress tab is the list of finished turns.</summary>
+    public bool ShowsList => Page == ProgressPage && Current is null;
+    private bool ShowBack => Page == ProgressPage && _pages.Count == 0 && Current is not null;
+    private string TabLabel(int i) => i == 0 && _pages.Count == 0 ? "履歴" : Tabs[i];
     public override SizeF Size => new(CardWidth, CardHeight);
     public override float Radius => 28;
     public override float FixedTop => Header; // the header stays put while the body changes pages
 
-    public NoticeData? Current => _pages.Count > 0 ? _pages[PageIndex] : null;
+    public NoticeData? Current => _pages.Count > 0 ? _pages[PageIndex] : _viewed is not null && _recent.Contains(_viewed) ? _viewed : null;
     private bool Done => Current?.Type == NoticeType.Completed;
     private bool ShowClose => !Menu && Done;
     private bool ShowJump => Page == ProgressPage && Current?.Target is not null;
-    private RectangleF MoreRect => new(_segments[0].X - ButtonGap - ButtonSize, (Header - ButtonSize) / 2, ButtonSize, ButtonSize);
+    private static RectangleF BackRect => new(Pad, (Header - BackSize) / 2, BackSize, BackSize);
+    // The main menu has the Dock to go to the other pages; only a card opened by a notice keeps the button.
+    private RectangleF MoreRect => new(_segments[0].X - ButtonGap - (Menu ? 0 : ButtonSize), (Header - ButtonSize) / 2, Menu ? 0 : ButtonSize, ButtonSize);
     private RectangleF CloseRect => new(MoreRect.X - ButtonGap - ButtonSize, MoreRect.Y, ButtonSize, ButtonSize);
     private RectangleF JumpRect => new((ShowClose ? CloseRect.X : MoreRect.X) - ButtonGap - ButtonSize, MoreRect.Y, ButtonSize, ButtonSize);
     private float ButtonsLeft => ShowJump ? JumpRect.X : ShowClose ? CloseRect.X : MoreRect.X;
@@ -80,6 +95,7 @@ internal sealed class ProgressSurface : IslandSurface
         var key = Current is { } current ? KeyOf(current) : null;
         var signature = SignatureOf(pages);
         _pages = pages;
+        if (pages.Count > 0) _viewed = null; // a running session takes the tab back
         var at = key is null ? -1 : pages.ToList().FindIndex(data => KeyOf(data) == key);
         PageIndex = at >= 0 ? at : Math.Clamp(PageIndex, 0, Math.Max(0, pages.Count - 1));
         if (signature == _signature) return false;
@@ -89,6 +105,25 @@ internal sealed class ProgressSurface : IslandSurface
 
     public void SetUsage(ProviderUsage? claude, ProviderUsage? codex) => (_claude, _codex) = (claude, codex);
 
+    /// <summary>Takes the list of finished turns, newest first. False when nothing on the card would change.</summary>
+    public bool SetRecent(IReadOnlyList<NoticeData> recent)
+    {
+        var same = recent.Count == _recent.Count && recent.Zip(_recent).All(pair => ReferenceEquals(pair.First, pair.Second));
+        _recent = recent;
+        return !same && Page == ProgressPage && _pages.Count == 0;
+    }
+
+    /// <summary>Opens a row of the list as the card above it; false when there is no such row.</summary>
+    public bool Open(int row)
+    {
+        if (row < 0 || row >= Math.Min(ListRows, _recent.Count)) return false;
+        _viewed = _recent[row];
+        return true;
+    }
+
+    /// <summary>Back from an opened finished turn to the list.</summary>
+    public void CloseViewed() => _viewed = null;
+
     /// <summary>Moves to another session's page; false when there is none there.</summary>
     public bool GoTo(int index)
     {
@@ -97,19 +132,27 @@ internal sealed class ProgressSurface : IslandSurface
         return true;
     }
 
-    public ProgressHit HitAt(PointF point, out int dot)
+    public ProgressHit HitAt(PointF point, out int index)
     {
-        dot = -1;
+        index = -1;
+        if (ShowBack && RectangleF.Inflate(BackRect, 4, 4).Contains(point)) return ProgressHit.Back;
         if (ShowClose && RectangleF.Inflate(CloseRect, 4, 4).Contains(point)) return ProgressHit.Close;
         if (ShowJump && RectangleF.Inflate(JumpRect, 4, 4).Contains(point)) return ProgressHit.Jump;
-        if (RectangleF.Inflate(MoreRect, 4, 4).Contains(point)) return ProgressHit.More;
+        if (!Menu && RectangleF.Inflate(MoreRect, 4, 4).Contains(point)) return ProgressHit.More;
         if (_segments[0].Contains(point)) return ProgressHit.ProgressTab;
         if (_segments[1].Contains(point)) return ProgressHit.UsageTab;
+        if (ShowsList)
+            for (var i = 0; i < Math.Min(ListRows, _recent.Count); i++)
+                if (RowRect(i).Contains(point))
+                {
+                    index = i;
+                    return ProgressHit.Row;
+                }
         if (Page == ProgressPage && _pages.Count > 1)
             for (var i = 0; i < _pages.Count; i++)
                 if (RectangleF.Inflate(DotRect(i), 5, 7).Contains(point))
                 {
-                    dot = i;
+                    index = i;
                     return ProgressHit.Dot;
                 }
         return ProgressHit.None;
@@ -143,16 +186,17 @@ internal sealed class ProgressSurface : IslandSurface
         if (current is null)
         {
             // Nothing to name: the page's own title stands where the session would.
-            IslandStyle.Text(g, Page == UsagePage ? "使用状況" : "進捗", style.Name, IslandStyle.Primary, Pad, Header / 2 + 5);
+            IslandStyle.Text(g, Page == UsagePage ? "使用状況" : "履歴", style.Name, IslandStyle.Primary, Pad, Header / 2 + 5);
         }
         else
         {
             var done = current.Type == NoticeType.Completed;
             var state = done ? IslandStyle.Success : Agent.Accent(current.Kind);
-            g.DrawImage(style.Icon(current.Kind), new RectangleF(Pad, (Header - 30) / 2, 30, 30));
+            var lead = ShowBack ? BackSize + 10 : 0; // the back button stands before the logo
+            g.DrawImage(style.Icon(current.Kind), new RectangleF(Pad + lead, (Header - 30) / 2, 30, 30));
             var name = Agent.Name(current.Kind);
-            IslandStyle.Text(g, name, style.Name, IslandStyle.Primary, Pad + 30 + 10, Header / 2 + 5);
-            var x = Pad + 30 + 10 + style.MeasureWidth(name, style.Name) + 14;
+            IslandStyle.Text(g, name, style.Name, IslandStyle.Primary, Pad + lead + 30 + 10, Header / 2 + 5);
+            var x = Pad + lead + 30 + 10 + style.MeasureWidth(name, style.Name) + 14;
             using (var dot = new SolidBrush(state)) g.FillEllipse(dot, x, Header / 2 - 3.5f, 7, 7);
             // The message that started the turn; a turn begun by a picture alone has none, so the folder it works in stands in.
             var folder = current.Target?.Cwd is { Length: > 0 } cwd ? Path.GetFileName(cwd.TrimEnd('\\', '/')) : null;
@@ -160,6 +204,15 @@ internal sealed class ProgressSurface : IslandSurface
             IslandStyle.TextTrimmed(g, message, style.Body, state, x + 14, Header / 2 + 4.5f, Math.Max(0, ButtonsLeft - 12 - x - 14));
         }
 
+        if (ShowBack)
+        {
+            var back = BackRect;
+            var hot = Hover == ProgressHit.Back;
+            Button(g, back, hot);
+            using var chevron = new Pen(hot ? IslandStyle.Primary : IslandStyle.Secondary, 1.9f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round };
+            var (cx, cy) = (back.X + back.Width / 2, back.Y + back.Height / 2);
+            g.DrawLines(chevron, [new PointF(cx + 2, cy - 5), new PointF(cx - 2.5f, cy), new PointF(cx + 2, cy + 5)]);
+        }
         if (ShowJump)
         {
             var jump = JumpRect;
@@ -180,12 +233,12 @@ internal sealed class ProgressSurface : IslandSurface
             g.DrawLine(cross, cx - 4, cy + 4, cx + 4, cy - 4);
         }
 
-        // More (Done, History, Settings): four small squares, as a launcher's grid.
+        // More (Settings): four small squares, as a launcher's grid.
         var more = MoreRect;
         var moreHot = Hover == ProgressHit.More;
-        Button(g, more, moreHot);
+        if (!Menu) Button(g, more, moreHot);
         using (var square = new SolidBrush(moreHot ? IslandStyle.Primary : IslandStyle.Secondary))
-            for (var i = 0; i < 4; i++)
+            for (var i = 0; i < (Menu ? 0 : 4); i++)
             {
                 var cell = new RectangleF(more.X + more.Width / 2 - 6 + i % 2 * 7, more.Y + more.Height / 2 - 6 + i / 2 * 7, 5, 5);
                 using var path = IslandStyle.ContinuousRect(cell, 1.4f, 0);
@@ -206,7 +259,7 @@ internal sealed class ProgressSurface : IslandSurface
                 using var fill = new SolidBrush(selected ? IslandStyle.Thumb : IslandStyle.Alpha2);
                 g.FillPath(fill, path);
             }
-            var label = Tabs[i];
+            var label = TabLabel(i);
             IslandStyle.Text(g, label, style.Body, selected ? IslandStyle.Primary : IslandStyle.Secondary,
                 _segments[i].X + (_segments[i].Width - style.MeasureWidth(label, style.Body)) / 2, _segments[i].Y + SegmentHeight / 2 + 4.5f);
         }
@@ -224,8 +277,7 @@ internal sealed class ProgressSurface : IslandSurface
     {
         if (Current is not { } current)
         {
-            const string empty = "実行中のセッションはありません";
-            IslandStyle.Text(g, empty, style.Body, IslandStyle.Secondary, (CardWidth - style.MeasureWidth(empty, style.Body)) / 2, Header + TileTop + Rows * RowHeight / 2 + 4.5f);
+            DrawList(g, style);
             return;
         }
         var accent = Agent.Accent(current.Kind);
@@ -240,7 +292,7 @@ internal sealed class ProgressSurface : IslandSurface
         {
             var rect = DotRect(i);
             using var path = IslandStyle.ContinuousRect(rect, rect.Height / 2, 0);
-            var color = i == PageIndex ? Agent.Accent(_pages[i].Kind) : i == HoverDot ? IslandStyle.Alpha4 : IslandStyle.Alpha3;
+            var color = i == PageIndex ? Agent.Accent(_pages[i].Kind) : i == HoverIndex ? IslandStyle.Alpha4 : IslandStyle.Alpha3;
             using var fill = new SolidBrush(color);
             g.FillPath(fill, path);
         }
@@ -325,6 +377,46 @@ internal sealed class ProgressSurface : IslandSurface
         format.FormatFlags = StringFormatFlags.LineLimit;
         format.Trimming = StringTrimming.EllipsisWord;
         g.DrawString(text, style.Body, brush, RectangleF.Inflate(tile, -16, -12), format);
+    }
+
+    // ---- history list (the progress tab with no session running) ----
+
+    private static RectangleF RowRect(int index) => new(Pad - 6, ListTop + index * ListRowHeight, CardWidth - 2 * Pad + 12, ListRowHeight - 2);
+
+    private void DrawList(Graphics g, IslandStyle style)
+    {
+        if (_recent.Count == 0)
+        {
+            const string empty = "完了したものはまだありません";
+            IslandStyle.Text(g, empty, style.Body, IslandStyle.Secondary, (CardWidth - style.MeasureWidth(empty, style.Body)) / 2, Header + TileTop + Rows * RowHeight / 2 + 4.5f);
+            return;
+        }
+        for (var i = 0; i < Math.Min(ListRows, _recent.Count); i++)
+        {
+            var turn = _recent[i];
+            var row = RowRect(i);
+            if (Hover == ProgressHit.Row && HoverIndex == i)
+            {
+                using var path = IslandStyle.ContinuousRect(row, 12, 0);
+                using var fill = new SolidBrush(IslandStyle.Alpha1);
+                g.FillPath(fill, path);
+            }
+            var icon = new RectangleF(Pad, row.Y + (row.Height - 22) / 2, 22, 22);
+            g.DrawImage(style.Icon(turn.Kind), icon);
+            var badge = new RectangleF(icon.Right - 6, icon.Bottom - 6, 9, 9);
+            using (var ring = new SolidBrush(Color.Black)) g.FillEllipse(ring, RectangleF.Inflate(badge, 1.5f, 1.5f));
+            using (var dot = new SolidBrush(IslandStyle.Success)) g.FillEllipse(dot, badge);
+            var finished = turn.Card?.Stats?.FirstOrDefault(stat => stat.Label == "Finished").Value;
+            var took = turn.Trailing.Length > 0 ? $"所要 {turn.Trailing}" : "";
+            var right = string.Join(" · ", new[] { took, finished }.Where(part => !string.IsNullOrEmpty(part)));
+            var rightWidth = style.MeasureWidth(right, style.Caption);
+            style.RightAligned(g, right, style.Caption, IslandStyle.Secondary, CardWidth - Pad, row.Y + row.Height / 2 + 4);
+            var textX = Pad + 22 + 12;
+            var name = Agent.Name(turn.Kind);
+            IslandStyle.Text(g, name, style.Body, IslandStyle.Primary, textX, row.Y + row.Height / 2 + 4.5f);
+            var projectX = textX + style.MeasureWidth(name, style.Body) + 12;
+            IslandStyle.TextTrimmed(g, turn.Subtitle, style.Caption, IslandStyle.Tertiary, projectX, row.Y + row.Height / 2 + 4, Math.Max(0, CardWidth - Pad - rightWidth - 16 - projectX));
+        }
     }
 
     // ---- usage page ----

@@ -11,7 +11,6 @@ internal static class ActivitySettings
     public const string HoverOpen = "HoverOpen";
     public const string HoverDelayMs = "HoverDelayMs";
     public const string FullscreenQuiet = "FullscreenQuiet";
-    public const string ShowClock = "ShowClock";
     public const string NotifyQuestion = "NotifyQuestion";
     public const string NotifyQuota = "NotifyQuota";
     private const string KeyPath = @"Software\TrayUsage";

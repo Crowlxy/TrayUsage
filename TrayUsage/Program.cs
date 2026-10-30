@@ -61,7 +61,7 @@ internal sealed class UsageContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _doneTimer = new() { Interval = 4500 };
     private readonly ActivityMonitor _monitor = new();
     private IReadOnlyList<AgentSession> _running = [];
-    private readonly List<CompletedTurn> _recent = [];
+    private readonly List<NoticeData> _recent = []; // finished turns, newest first: the card's 履歴 list
     private NoticeData? _alertNotice;
     private readonly List<AskRequest> _asks = []; // approvals and questions whose hooks are waiting for the tray
     private readonly HashSet<string> _answeredAsks = [];
@@ -75,7 +75,8 @@ internal sealed class UsageContext : ApplicationContext
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
     private readonly UsageIsland _island = new();
-    private readonly UsageHistory _history = new();
+    private readonly Workspace _workspace = new(Environment.GetCommandLineArgs().Any(arg => arg.StartsWith("--demo-panel")) ? Path.Combine(Path.GetTempPath(), "trayusage-demo.json") : null);
+    private ClipboardWatcher? _clipboard;
     private readonly HoverTrigger _hover;
     private CapsLockHook? _capsLock;
     private ProviderUsage? _claudeUsage;
@@ -120,8 +121,12 @@ internal sealed class UsageContext : ApplicationContext
             if (_previewTimer.Enabled) { _previewTimer.Stop(); _previewTimer.Start(); } // a panel opened from the tray stays while it is used
             if (_detail is not null) { _doneTimer.Stop(); _doneTimer.Start(); } // so does a detail card
         };
-        _island.SetHistory(_history);
         _island.SettingsProvider = SettingRows;
+        _island.SetWorkspace(_workspace);
+        _island.FilesDropped += files => _workspace.AddFiles(files);
+        _island.FilesDragEntered += ShowFileTray;
+        _island.TaskPromptRequested += PromptTask;
+        _clipboard = new ClipboardWatcher(_workspace);
         _island.SettingChanged += OnIslandSetting;
         _island.NoticeClicked += OnNoticeClicked;
         _island.PillClicked += ShowPreview;
@@ -129,7 +134,7 @@ internal sealed class UsageContext : ApplicationContext
         _askTimer.Tick += (_, _) => PollAsks();
         _askTimer.Start();
         _island.DetailLeft += () => { if (_detail is not null) FinishAlert(); }; // a card goes away when the pointer does
-        _island.MoreRequested += ShowMore; // the card's "more" button: the Done / History / Settings panel takes its place
+        _island.MoreRequested += ShowMore; // the card's "more" button: the calendar / clipboard / tasks / files panel takes its place
         _island.SessionRequested += target => { if (!SessionJump.Activate(target)) ShowPreview(); };
         _island.Hidden += () => GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         _holdTimer.Tick += (_, _) => { _holdTimer.Stop(); _previewTimer.Stop(); ShowUsage(); RefreshIfStale(); };
@@ -163,7 +168,6 @@ internal sealed class UsageContext : ApplicationContext
         {
             var interval = _island.Visible ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(60);
             if (DateTime.UtcNow - _lastRefreshAt >= interval) _ = RefreshAsync();
-            _island.RefreshElapsed();
         };
         _timer.Start();
         UpdateActivityMenu();
@@ -172,6 +176,45 @@ internal sealed class UsageContext : ApplicationContext
         if (Environment.GetCommandLineArgs().Contains("--demo")) StartDemo();
         if (Environment.GetCommandLineArgs().Contains("--demo-ask")) StartDemoAsk(approvalOnly: false);
         if (Environment.GetCommandLineArgs().Contains("--demo-approval")) StartDemoAsk(approvalOnly: true);
+        if (Environment.GetCommandLineArgs().Contains("--demo-history")) StartDemoHistory();
+        if (Environment.GetCommandLineArgs().FirstOrDefault(arg => arg.StartsWith("--demo-panel")) is { } demoPanel) StartDemoPanel(demoPanel);
+    }
+
+    /// <summary>--demo-panel[=page]: the panel opens on a page (0 calendar, 1 clipboard, 2 tasks, 3 files) with sample content, kept in a temporary file.</summary>
+    private void StartDemoPanel(string argument)
+    {
+        var page = int.TryParse(argument.Split('=').ElementAtOrDefault(1), out var parsed) ? parsed : 0;
+        var today = DateOnly.FromDateTime(DateTime.Today);
+        _workspace.Tasks.Clear();
+        _workspace.Files.Clear();
+        _workspace.AddTask("請求書を送る", today);
+        _workspace.AddTask("週次レポートを書く", today.AddDays(1));
+        _workspace.AddTask("歯医者の予約をとる", null);
+        _workspace.AddTask("Review the pull request for the settings page", today);
+        _workspace.AddTask("牛乳を買う", null);
+        _workspace.ToggleTask(_workspace.Tasks[4].Id);
+        _workspace.AddClip("https://github.com/lucacadalora/oyenza-studio");
+        _workspace.AddClip("TrayUsage/PanelSurface.cs\nline 2 of a copied block\nline 3");
+        _workspace.AddClip("明日の会議は 10:30 から、場所は 3F の小会議室です。");
+        _workspace.AddFiles([Path.Combine(Environment.CurrentDirectory, "README.md"), Environment.CurrentDirectory, Path.Combine(Environment.CurrentDirectory, "missing-file.txt")]);
+        _usageShown = true;
+        _hover.PanelOpenedByHover = false;
+        _island.ShowPage(page);
+        _previewTimer.Interval = 120000;
+        _previewTimer.Start();
+    }
+
+    /// <summary>--demo-history: a few finished turns in the card's 履歴 list, to look at it without waiting for real ones.</summary>
+    private void StartDemoHistory()
+    {
+        var now = DateTimeOffset.Now;
+        _recent.AddRange(
+        [
+            DoneNotice(new(AgentKind.Claude, "Context", TimeSpan.FromSeconds(134), now.AddMinutes(-3), Demo(AgentKind.Claude, "claude-done"))),
+            DoneNotice(new(AgentKind.Codex, "wa-site", TimeSpan.FromMinutes(12) + TimeSpan.FromSeconds(8), now.AddMinutes(-26), Demo(AgentKind.Codex, "codex-done"))),
+            DoneNotice(new(AgentKind.Claude, "TrayUsage", TimeSpan.FromSeconds(48), now.AddHours(-2), Demo(AgentKind.Claude, "claude-done-2")))
+        ]);
+        _island.SetRecent(_recent);
     }
 
     /// <summary>--demo-ask: an approval and a question on the island, answered into nothing (no hook is waiting), to look at their layout.</summary>
@@ -307,12 +350,11 @@ internal sealed class UsageContext : ApplicationContext
         [
             new("notify", "通知", "完了を通知", [], Flag(ActivitySettings.NotifyCompletion)),
             new("question", "通知", "質問待ちを通知", [], Flag(ActivitySettings.NotifyQuestion)),
-            new("quota", "通知", "使用量の警告・リセットを通知", [], Flag(ActivitySettings.NotifyQuota)),
+            new("quota", "通知", "使用量の警告・リセット", [], Flag(ActivitySettings.NotifyQuota)),
             new("hook", "通知", "承認待ちを通知 (Hook)", [], hookInstalled ? 1 : 0),
-            new("answer", "通知", "トレイから承認・質問に答える (Hook)", [], answerMode ? 1 : 0),
-            new("fullscreen", "通知", "全画面アプリ中は通知しない", [], Flag(ActivitySettings.FullscreenQuiet)),
+            new("answer", "通知", "トレイから回答 (Hook)", [], answerMode ? 1 : 0),
+            new("fullscreen", "通知", "全画面中は通知しない", [], Flag(ActivitySettings.FullscreenQuiet)),
             new("theme", "表示", "テーマ", ["Classic", "Pill"], Math.Clamp(ActivitySettings.GetInt(ActivitySettings.Theme, 0), 0, Themes.Length - 1)),
-            new("clock", "表示", "時計を表示", [], Flag(ActivitySettings.ShowClock)),
             new("progress", "表示", "実行中の進捗を表示", [], Flag(ActivitySettings.ShowProgress)),
             new("hover", "上端ホバー", "上端ホバーで開く", [], Flag(ActivitySettings.HoverOpen)),
             new("delay", "上端ホバー", "待ち時間", DelayLabels, Math.Max(0, Array.FindIndex(HoverDelays, d => d.Ms == delay))),
@@ -353,7 +395,6 @@ internal sealed class UsageContext : ApplicationContext
                     MessageBox.Show($"Hook を変更できませんでした。\n{ex.Message}", "Tray Usage", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 break;
-            case "clock": ChangeSetting(() => ActivitySettings.Set(ActivitySettings.ShowClock, value != 0)); break;
             case "delay": ChangeSetting(() => ActivitySettings.SetInt(ActivitySettings.HoverDelayMs, HoverDelays[Math.Clamp(value, 0, HoverDelays.Length - 1)].Ms)); break;
             case "theme": ChangeSetting(() => ActivitySettings.SetInt(ActivitySettings.Theme, value)); break;
             case "startup":
@@ -421,9 +462,9 @@ internal sealed class UsageContext : ApplicationContext
             if (snapshot.ReadLarge) GC.Collect(2, GCCollectionMode.Forced, blocking: true);
             var absorbed = UpdateProgressCard(snapshot);
             _running = snapshot.Running;
-            foreach (var turn in snapshot.Completed) _recent.Insert(0, turn);
-            if (_recent.Count > 5) _recent.RemoveRange(5, _recent.Count - 5);
-            _island.SetActivity(_recent);
+            foreach (var turn in snapshot.Completed) _recent.Insert(0, DoneNotice(turn));
+            if (_recent.Count > ProgressSurface.ListRows) _recent.RemoveRange(ProgressSurface.ListRows, _recent.Count - ProgressSurface.ListRows);
+            _island.SetRecent(_recent);
             _island.SetSessions(SessionPages());
             // A turn that finished under an open progress card was shown by that card; it needs no notice of its own.
             var announce = snapshot.Completed.Where(turn => !ReferenceEquals(turn, absorbed)).ToList();
@@ -449,16 +490,16 @@ internal sealed class UsageContext : ApplicationContext
 
     /// <summary>
     /// What the card pages through: a page per running session, in the order they started. The notice whose card is open stays a
-    /// page after its turn is over (and for a demo notice, which no log backs); with nothing else, the latest finished turn is the page.
+    /// page while its turn runs (and for a demo notice, which no log backs). A finished turn is no page: with no pages the card
+    /// turns into the list of finished turns.
     /// </summary>
     private List<NoticeData> SessionPages()
     {
         var pages = _running.Select(session => RunningNotice([session])).ToList();
         if (_demoSessions is not null) pages.AddRange(_demoSessions);
-        if (_detail is { Type: NoticeType.Running or NoticeType.Completed } open &&
+        if (_detail is { Type: NoticeType.Running } open &&
             !pages.Any(page => ProgressSurface.KeyOf(page) == ProgressSurface.KeyOf(open)))
             pages.Add(open);
-        else if (pages.Count == 0 && _recent.Count > 0) pages.Add(DoneNotice(_recent[0]));
         return pages;
     }
 
@@ -731,7 +772,7 @@ internal sealed class UsageContext : ApplicationContext
     }
 
     /// <summary>
-    /// The card's "more" button: the Done / History / Settings panel. The pointer is on the island when it is pressed, so the panel
+    /// The card's "more" button: the panel of calendar, clipboard, tasks and files. The pointer is on the island when it is pressed, so the panel
     /// goes when the pointer leaves it, as a hover-opened one does; no timer closes it while it is in use.
     /// </summary>
     private void ShowMore()
@@ -743,7 +784,37 @@ internal sealed class UsageContext : ApplicationContext
         _alertNotice = null;
         _usageShown = true;
         _hover.PanelOpenedByHover = true;
-        _island.ShowMore();
+        _island.ShowSettings();
+    }
+
+    /// <summary>Asks for a task's text in a small box under the island and adds it; the island stays up meanwhile.</summary>
+    private void PromptTask(DateOnly? due)
+    {
+        _hover.PanelOpenedByHover = false; // the box takes the focus and the pointer leaves the island; it must not collapse under the typing
+        var below = _island.ScreenBody ?? Screen.PrimaryScreen!.Bounds with { Height = 0 };
+        var prompt = new InputPrompt("タスクを入力", due is { } day ? $"{day.Month}月{day.Day}日" : null, below);
+        prompt.Submitted += text => _workspace.AddTask(text, due);
+        prompt.FormClosed += (_, _) =>
+        {
+            prompt.Dispose();
+            _hover.PanelOpenedByHover = true; // back to leaving with the pointer
+            _hover.AwaitPointer();
+        };
+        prompt.Show();
+    }
+
+    /// <summary>Files are being dragged over the island: the file tray opens under them, like a hover-opened panel.</summary>
+    private void ShowFileTray()
+    {
+        if (_island.PanelPage == PanelSurface.FilesPage) return;
+        _holdTimer.Stop();
+        _previewTimer.Stop();
+        _detail = null;
+        _doneTimer.Stop();
+        _alertNotice = null;
+        _usageShown = true;
+        _hover.PanelOpenedByHover = true;
+        _island.ShowPage(PanelSurface.FilesPage);
     }
 
     private void ShowPreview()
@@ -809,7 +880,6 @@ internal sealed class UsageContext : ApplicationContext
             SetProviderMenu(_claude, "Claude Code", claude);
             SetProviderMenu(_codex, "Codex", codex);
             _updated.Text = $"更新: {now:HH:mm:ss}";
-            _history.Record(DateTimeOffset.Now, claude, codex);
             _island.SetUsage(claude, codex);
             AlertQuota(AgentKind.Claude, claude);
             AlertQuota(AgentKind.Codex, codex);
@@ -894,6 +964,7 @@ internal sealed class UsageContext : ApplicationContext
             _spinTimer.Dispose();
             _doneTimer.Dispose();
             _capsLock?.Dispose();
+            _clipboard?.Dispose();
             _hover.Dispose();
             _island.Dispose();
             _icon.Visible = false;

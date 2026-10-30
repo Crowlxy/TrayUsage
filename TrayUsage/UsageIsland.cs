@@ -25,16 +25,25 @@ internal sealed class UsageIsland : IDisposable
     private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f;
     private readonly IslandStyle _style = new();
     private readonly PanelSurface _panel;
+    private readonly FileDropTarget _drop = new();
+    private readonly System.Windows.Forms.Timer _flashTimer = new() { Interval = 1800 };
+    private Control? _dragHost;
+    private (PanelHit Hit, PointF Point)? _press; // a file row held down: a click opens it, a drag takes it out
+    private int _returnPage;
     private readonly Stopwatch _clock = new();
     private readonly bool _animate = ShouldAnimate();
     // Every spring the island owns is listed in _all (shape, content, panel) or _knobs (one per switch); _every is both. The frame
     // loop advances, snaps and tests rest on _every, so a spring added to either list is looked after everywhere.
     private readonly Spring _w = Spring.Pixels(PillWidth), _h = Spring.Pixels(PillHeight), _r = Spring.Pixels(PillHeight / 2), _top = Spring.Pixels(0);
     private readonly Spring _contentAlpha = Spring.Unit(0), _ghostAlpha = Spring.Unit(0), _presence = Spring.Unit(0), _lift = Spring.Pixels(0);
-    private readonly Spring _dock = Spring.Unit(1), _tabX = Spring.Pixels(0), _tabW = Spring.Pixels(0), _meter = Spring.Unit(1), _gear = Spring.Pixels(0);
+    private readonly Spring _dock = Spring.Unit(1);
+    private readonly Spring _dockAlpha = Spring.Unit(0);
+    private readonly DockBar _dockBar;
+    private Bitmap? _dockBitmap;
+    private (int Selected, int Hover, int Files, float Scale) _dockKey;
+    private RectangleF _dockPx;
     private readonly Spring[] _knobs = Enumerable.Range(0, PanelSurface.MaxSettingRows).Select(_ => Spring.Unit(0)).ToArray();
     private readonly float[] _knobValues = new float[PanelSurface.MaxSettingRows];
-    private int _clockMinute = -1, _returnPage;
     private bool _pageSwitch, _ghostScales = true;
     private double _glowTime = -1, _usedPercent;
     private Color _glowColor = Color.Black;
@@ -52,7 +61,7 @@ internal sealed class UsageIsland : IDisposable
     private SizeF _ghostSize;
     private Point _origin;
     private float _scale = 1;
-    private bool _shown, _fineTimer, _meterArmed;
+    private bool _shown, _fineTimer;
     private double _lastTick, _contentArm;
     private RectangleF _bodyPx;
     private PointF _contentOrigin;
@@ -61,7 +70,25 @@ internal sealed class UsageIsland : IDisposable
     public UsageIsland()
     {
         _panel = new PanelSurface(_style);
-        _all = [_w, _h, _r, _top, _dock, _contentAlpha, _ghostAlpha, _presence, _lift, _tabX, _tabW, _meter, _gear];
+        _dockBar = new DockBar(_style);
+        _panel.Icons.Loaded += () =>
+        {
+            if (_shown && _surface == _panel && _panel.Page == PanelSurface.FilesPage) Refresh();
+        };
+        _drop.Entered += () =>
+        {
+            FilesDragEntered?.Invoke();
+            SetDropHot(true);
+        };
+        _drop.Left += () => SetDropHot(false);
+        _drop.Dropped += files => FilesDropped?.Invoke(files);
+        _flashTimer.Tick += (_, _) =>
+        {
+            _flashTimer.Stop();
+            _panel.Flash = null;
+            if (_shown && _surface == _panel) Refresh();
+        };
+        _all = [_w, _h, _r, _top, _dock, _dockAlpha, _contentAlpha, _ghostAlpha, _presence, _lift];
         _every = [.. _all, .. _knobs];
     }
 
@@ -77,8 +104,6 @@ internal sealed class UsageIsland : IDisposable
     }
 
     public bool Visible { get; private set; }
-
-    private int _panelPage = -1;
 
     private bool Docked => _theme != IslandTheme.Pill;
     private float RestTop => Docked ? 0 : TopGap;
@@ -154,12 +179,21 @@ internal sealed class UsageIsland : IDisposable
     /// <summary>The pointer left an open detail card.</summary>
     public event Action? DetailLeft;
 
-    /// <summary>An activity row was clicked: the session to go back to.</summary>
+    /// <summary>The panel's "＋ 追加" was clicked: the owner asks for the task's text (the island cannot take typing) and adds it, due on the day given or on none.</summary>
+    public event Action<DateOnly?>? TaskPromptRequested;
+
+    /// <summary>Files were dropped on the island: the owner puts them in the file tray.</summary>
+    public event Action<string[]>? FilesDropped;
+
+    /// <summary>Files are being dragged over the island: the owner opens the file tray so they can be dropped on it.</summary>
+    public event Action? FilesDragEntered;
+
+    /// <summary>The card's jump button was clicked: the session to go back to.</summary>
     public event Action<SessionTarget>? SessionRequested;
 
     public NoticeData? CurrentNotice => _shown ? (_surface as NoticeSurface)?.Data : null;
 
-    /// <summary>The card's "more" button was clicked: the owner opens the Done / History / Settings panel in its place.</summary>
+    /// <summary>The card's "more" button was clicked: the owner opens the settings panel in its place.</summary>
     public event Action? MoreRequested;
 
     /// <summary>A notice's detail card is up (a click on it fires <see cref="NoticeClicked"/> too, to close it).</summary>
@@ -167,8 +201,8 @@ internal sealed class UsageIsland : IDisposable
 
     private bool WantsHand => _shown && (_surface is NoticeSurface or DetailSurface or IdleSurface ||
         _surface is AskSurface { Hover: not AskHit.None } ||
-        _surface is ProgressSurface { } card && (card.Hover != ProgressHit.None || card.HoverDot >= 0) ||
-        _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverBackButton || p.HoverRow >= 0 || p.HoverRange >= 0));
+        _surface is ProgressSurface { } card && (card.Hover != ProgressHit.None || card.HoverIndex >= 0) ||
+        _surface is PanelSurface { } p && (p.Hover is not null || p.HoverRow >= 0) || _dockBar.Hover >= 0);
 
     // The main menu is the card opened by the user (or by Caps Lock / hover) and the panel behind its "more" button; a card opened by a
     // notice is a notice, and goes with it.
@@ -176,12 +210,22 @@ internal sealed class UsageIsland : IDisposable
     public IslandMode Mode => IsMenu ? IslandMode.Panel : IslandMode.Notice;
     public bool PanelActive => Visible && _shown && IsMenu;
 
-    /// <summary>The visible body in screen pixels, or null when nothing is shown.</summary>
-    public Rectangle? ScreenBody => Visible && _shown && !_bodyPx.IsEmpty
-        ? Rectangle.Round(new RectangleF(_origin.X + _bodyPx.X, _origin.Y + _bodyPx.Y, _bodyPx.Width, _bodyPx.Height))
-        : null;
+    /// <summary>The page the panel is showing, or -1 when it is not on screen.</summary>
+    public int PanelPage => Visible && _shown && _surface == _panel ? _panel.Page : -1;
 
-    public void SetHistory(UsageHistory history) => _panel.SetHistory(history);
+    /// <summary>The visible body in screen pixels, or null when nothing is shown.</summary>
+    public Rectangle? ScreenBody
+    {
+        get
+        {
+            if (!Visible || !_shown || _bodyPx.IsEmpty) return null;
+            var area = DockActive ? RectangleF.Union(_bodyPx, _dockPx) : _bodyPx;
+            return Rectangle.Round(new RectangleF(_origin.X + area.X, _origin.Y + area.Y, area.Width, area.Height));
+        }
+    }
+
+    /// <summary>The Dock is on screen (a menu is up), so the pointer can use it.</summary>
+    private bool DockActive => _shown && IsMenu && _dockAlpha.Value > 0.5 && !_dockPx.IsEmpty;
 
     private ProviderUsage? _claudeUsage, _codexUsage;
 
@@ -225,35 +269,21 @@ internal sealed class UsageIsland : IDisposable
         Display(new IdleSurface(_usedPercent), null, crossfade: Visible && _shown);
     }
 
-    /// <summary>The sessions the card pages through (a running turn each, or the finished turn that is in view); an open card follows them.</summary>
+    /// <summary>The finished turns the card lists when no session runs, newest first; an open card follows them.</summary>
+    public void SetRecent(IReadOnlyList<NoticeData> recent)
+    {
+        _cardRecent = recent;
+        if (!_shown || _surface is not ProgressSurface card || !card.SetRecent(recent)) return;
+        Refresh();
+    }
+
+    /// <summary>The sessions the card pages through (a running turn each); an open card follows them.</summary>
     public void SetSessions(IReadOnlyList<NoticeData> pages)
     {
         _cardPages = pages;
         if (!_shown || _surface is not ProgressSurface card || !card.SetPages(pages)) return;
         SetGlow(card, pulse: false); // a turn may have just finished
         Refresh();
-    }
-
-    public void SetActivity(IReadOnlyList<CompletedTurn> recent)
-    {
-        var before = _panel.Size;
-        _panel.SetActivity(recent);
-        if (_surface != _panel || !_shown) return;
-        AimTab(snap: false);
-        if (_panel.Size != before) Display(_panel, null, crossfade: false);
-        else Refresh();
-        UpdateSpin();
-    }
-
-    /// <summary>Re-renders the activity page so its elapsed times keep counting.</summary>
-    public void RefreshElapsed()
-    {
-        if (_surface != _panel || !_shown) return;
-        var minute = DateTime.Now.Minute;
-        var clockChanged = minute != _clockMinute && _panel.ShowClock;
-        _clockMinute = minute;
-        if (clockChanged) Refresh();
-        UpdateSpin();
     }
 
     /// <summary>Reloads the settings rows; switches slide to their new state.</summary>
@@ -269,17 +299,68 @@ internal sealed class UsageIsland : IDisposable
             if (snap) _knobs[i].Snap();
         }
         for (var i = 0; i < _knobs.Length; i++) _knobValues[i] = (float)_knobs[i].Value;
-        _panel.SetAnimation((float)_tabX.Value, (float)_tabW.Value, (float)_meter.Value, _knobValues, (float)_gear.Value);
+        _panel.SetAnimation(_knobValues);
         if (!Visible || !_shown || _surface != _panel) return;
         if (!snap) StartFrames();
         Refresh();
     }
 
-    /// <summary>Opens the panel on the settings page (from the tray menu).</summary>
-    public void ShowSettings(Screen? screen = null) => OpenPanel(screen, settings: true);
+    /// <summary>Hands the island what the calendar, clipboard, task and file pages show.</summary>
+    public void SetWorkspace(Workspace workspace)
+    {
+        _panel.SetWorkspace(workspace);
+        workspace.Changed += RefreshWorkspace;
+    }
 
-    /// <summary>Opens the Done / History panel (the card's "more" button).</summary>
-    public void ShowMore() => OpenPanel(null, settings: false);
+    private void RefreshWorkspace()
+    {
+        if (!Visible || !_shown) return;
+        if (_surface != _panel || _panel.Page == PanelSurface.SettingsPage)
+        {
+            if (IsMenu) Present(releaseCanvas: false); // only the Dock's file count can have changed
+            return;
+        }
+        // a list that grew or shrank changes the page's height: the island follows it
+        if (Math.Abs(_panel.Height - _h.Target) > 0.5) Display(_panel, null, crossfade: true);
+        else Refresh();
+    }
+
+    private void SetDropHot(bool hot)
+    {
+        if (_panel.DropHot == hot) return;
+        _panel.DropHot = hot;
+        if (_shown && _surface == _panel) Refresh();
+    }
+
+    /// <summary>Opens the panel on the settings page (from the tray menu).</summary>
+    public void ShowSettings(Screen? screen = null)
+    {
+        if (_panel.Page != PanelSurface.SettingsPage) _returnPage = _panel.Page;
+        _panel.Page = PanelSurface.SettingsPage;
+        OpenPanel(screen);
+    }
+
+    /// <summary>Opens the panel on the page it was last left on (the card's "more" button).</summary>
+    public void ShowMore(Screen? screen = null)
+    {
+        if (_panel.Page == PanelSurface.SettingsPage && !(Visible && _shown && _surface == _panel)) _panel.Page = _returnPage; // settings are not the resting page
+        OpenPanel(screen);
+    }
+
+    /// <summary>Opens the panel on one of its pages.</summary>
+    public void ShowPage(int page, Screen? screen = null)
+    {
+        _panel.Page = page;
+        if (page != PanelSurface.SettingsPage) _returnPage = page;
+        OpenPanel(screen);
+    }
+
+    private void OpenPanel(Screen? screen)
+    {
+        _panel.Hover = null;
+        RefreshSettings();
+        Display(_panel, screen, crossfade: Visible && _surface is NoticeSurface or ProgressSurface);
+    }
 
     /// <summary>Opens the main menu: the card, on the tab it was last left on.</summary>
     public void ShowPanel(Screen? screen = null)
@@ -288,15 +369,31 @@ internal sealed class UsageIsland : IDisposable
         OpenCard(screen, menu: true, focus: null);
     }
 
-    private IReadOnlyList<NoticeData> _cardPages = [];
+    private IReadOnlyList<NoticeData> _cardPages = [], _cardRecent = [];
     private int _cardTab = ProgressSurface.UsagePage;
 
-    /// <summary>Opens the card on the page of <paramref name="focus"/>'s session, as a notice (a notice not among the sessions gets a page of its own).</summary>
+    /// <summary>
+    /// Opens the card, as a notice when <paramref name="focus"/> is given: on the page of its session while it runs (a running notice not
+    /// among the sessions gets a page of its own); a finished turn opens in the list of finished turns, as the card above it.
+    /// </summary>
     private void OpenCard(Screen? screen, bool menu, NoticeData? focus)
     {
         var pages = _cardPages;
+        var recent = _cardRecent;
+        NoticeData? viewed = null;
         var index = 0;
-        if (focus is not null)
+        if (focus is { Type: NoticeType.Completed })
+        {
+            viewed = recent.FirstOrDefault(turn => ReferenceEquals(turn, focus)) ??
+                recent.FirstOrDefault(turn => ProgressSurface.KeyOf(turn) == ProgressSurface.KeyOf(focus) && turn.Title == focus.Title && turn.Trailing == focus.Trailing);
+            if (viewed is null)
+            {
+                viewed = focus;
+                recent = [focus, .. recent]; // a demo, or a turn that has left the list
+            }
+            pages = [];
+        }
+        else if (focus is not null)
         {
             var key = ProgressSurface.KeyOf(focus);
             index = pages.ToList().FindIndex(page => ProgressSurface.KeyOf(page) == key);
@@ -306,23 +403,9 @@ internal sealed class UsageIsland : IDisposable
                 index = 0;
             }
         }
-        var card = new ProgressSurface(_style, pages, index, menu, menu ? _cardTab : ProgressSurface.ProgressPage);
+        var card = new ProgressSurface(_style, pages, index, menu, menu ? _cardTab : ProgressSurface.ProgressPage, recent, viewed);
         card.SetUsage(_claudeUsage, _codexUsage);
         Display(card, screen, crossfade: Visible && _shown);
-    }
-
-    private void OpenPanel(Screen? screen, bool settings)
-    {
-        var showing = Visible && _shown && _surface == _panel;
-        if (settings)
-        {
-            if (_panel.Page != PanelSurface.SettingsPage) _returnPage = _panel.Page;
-            _panel.Page = PanelSurface.SettingsPage;
-        }
-        else if (_panel.Page == PanelSurface.SettingsPage && !showing) _panel.Page = _returnPage; // settings are not the resting page
-        RefreshSettings();
-        _clockMinute = DateTime.Now.Minute;
-        Display(_panel, screen, crossfade: Visible && _surface is NoticeSurface or ProgressSurface);
     }
 
     public void ShowNotice(NoticeData data)
@@ -366,12 +449,12 @@ internal sealed class UsageIsland : IDisposable
         // Closing, the card gathers into the pill as it rises into the screen edge: the content shrinks with the body and
         // fades slowly, and the island is gone once it has cleared the edge (see Step).
         _top.To(RetractTop, Motion.Close);
+        _dockAlpha.To(0, Motion.Fade);
         _pageSwitch = false;
         _glowRest = 0;
         if (!(_animate && ToGhost())) _contentAlpha.To(0, Motion.Fade);
         _lift.To(0, Motion.Rise);
         _contentArm = 0;
-        _meterArmed = false;
         SetInteractive(false);
         if (!_animate)
         {
@@ -403,7 +486,6 @@ internal sealed class UsageIsland : IDisposable
             _r.Jump(PillHeight / 2);
             _dock.Jump(Docked ? 1 : 0);
             _themeLater = null;
-            _meter.Jump(1);
             DisposeBitmaps();
             _window ??= new IslandWindow(this);
             Visible = true;
@@ -437,24 +519,13 @@ internal sealed class UsageIsland : IDisposable
         _r.To(surface.Radius, morph);
         _top.To(RestTop, Motion.Rise);
         _presence.To(1, Motion.Fade);
+        _dockAlpha.To(IsMenu ? 1 : 0, Motion.Fade);
         if (_contentAlpha.Value < 1 || crossfade)
         {
             _contentAlpha.To(0, Motion.Fade);
             _contentArm = growing ? Motion.GrowDelay : Motion.ShrinkDelay;
         }
         SetInteractive(true); // a notice answers a click, so its body takes the mouse (the rest of the window stays transparent)
-        if (surface is PanelSurface panel)
-        {
-            var opening = !wasVisible || _panelPage != panel.Page;
-            AimTab(snap: !wasVisible);
-            _panelPage = panel.Page;
-            // The usage meters and the history curves fill in after the shape has settled enough to read them.
-            if (opening && panel.Page == PanelSurface.HistoryPage && _animate)
-            {
-                _meter.Jump(0);
-                _meterArmed = true;
-            }
-        }
 
         if (!_animate)
         {
@@ -525,24 +596,6 @@ internal sealed class UsageIsland : IDisposable
         return (float)(_glowRest + pulse);
     }
 
-    private void AimTab(bool snap)
-    {
-        if (_panel.Page < PanelSurface.SettingsPage)
-        {
-            var tab = _panel.ActiveTabRect;
-            _tabX.To(tab.X, Motion.Slide);
-            _tabW.To(tab.Width, Motion.Slide);
-        }
-        _gear.To(_panel.Page == PanelSurface.SettingsPage ? 90 : 0, Motion.Slide);
-        if (snap || !_animate)
-        {
-            _tabX.Snap();
-            _tabW.Snap();
-            _gear.Snap();
-        }
-        else if (Visible) StartFrames();
-    }
-
     /// <summary>Hands the current content to the outgoing layer, which shrinks with the body and fades.</summary>
     private bool ToGhost()
     {
@@ -608,8 +661,6 @@ internal sealed class UsageIsland : IDisposable
         if (_contentArm > 0 && (_contentArm -= elapsed) <= 0)
         {
             _contentAlpha.To(1, Motion.Fade);
-            if (_meterArmed) _meter.To(1, Motion.Fill);
-            _meterArmed = false;
         }
         // Closing: the body (and its shadow) has risen fully above the screen edge.
         if (!_shown && _top.Target < 0 && _top.Value <= -(_h.Value + Shadow.Drop + Shadow.Reach))
@@ -618,13 +669,13 @@ internal sealed class UsageIsland : IDisposable
             HideNow();
             return;
         }
-        var springsSettled = _contentArm <= 0 && !_meterArmed && _glowTime < 0 && _themeLater is null && _every.All(s => s.IsSettled);
+        var springsSettled = _contentArm <= 0 && _glowTime < 0 && _themeLater is null && _every.All(s => s.IsSettled);
         var live = HasLiveIcons;
         var settled = springsSettled && !live;
         if (springsSettled)
             foreach (var spring in _every) spring.Snap();
         for (var i = 0; i < _knobs.Length; i++) _knobValues[i] = (float)_knobs[i].Value;
-        if (_surface is PanelSurface animated && animated.SetAnimation((float)_tabX.Value, (float)_tabW.Value, (float)_meter.Value, _knobValues, (float)_gear.Value))
+        if (_surface is PanelSurface animated && animated.SetAnimation(_knobValues))
         {
             _contentBitmap?.Dispose();
             _contentBitmap = null;
@@ -664,8 +715,8 @@ internal sealed class UsageIsland : IDisposable
         }
     }
 
-    private Size CanvasSize => new((int)Math.Ceiling((Math.Max(PanelSurface.MaxWidth, ProgressSurface.CardWidth) * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
-        (int)Math.Ceiling((TopGap + Math.Max(PanelSurface.MaxHeight, ProgressSurface.CardHeight) * MaxOvershoot + Shadow.Margin) * _scale));
+    private Size CanvasSize => new((int)Math.Ceiling((Math.Max(PanelSurface.Width, ProgressSurface.CardWidth) * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
+        (int)Math.Ceiling((TopGap + Math.Max(PanelSurface.MaxHeight, ProgressSurface.CardHeight) * MaxOvershoot + DockBar.Gap + DockBar.Height + Shadow.Margin) * _scale));
 
     private void Draw(Graphics g)
     {
@@ -724,6 +775,30 @@ internal sealed class UsageIsland : IDisposable
         using var rimPath = Outline(RectangleF.Inflate(body, -0.5f * s, -0.5f * s), radius - 0.5f * s, shoulder, topRound > 0 ? topRound - 0.5f * s : 0, closed: false);
         using var rim = new Pen(Color.FromArgb((int)(30 * presence), 255, 255, 255), Math.Max(1, s));
         g.DrawPath(rim, rimPath);
+        DrawDock(g, body, presence);
+    }
+
+    /// <summary>The Dock hangs a little under the body and rides it as it springs; it fades with the menu it belongs to.</summary>
+    private void DrawDock(Graphics g, RectangleF body, float presence)
+    {
+        var s = _scale;
+        var alpha = (float)Math.Clamp(_dockAlpha.Value, 0, 1) * presence;
+        if (alpha <= 0.004f || !(_surface is PanelSurface or ProgressSurface { Menu: true }))
+        {
+            _dockPx = RectangleF.Empty;
+            return;
+        }
+        var key = (_surface == _panel ? (_panel.Page == PanelSurface.SettingsPage ? DockBar.Settings : _panel.Page + 1) : DockBar.Home, _dockBar.Hover, _panel.FileCount, s);
+        if (_dockBitmap is null || key != _dockKey)
+        {
+            _dockKey = key;
+            (_dockBar.Selected, _, _dockBar.FileCount, _) = key;
+            _dockBitmap?.Dispose();
+            _dockBitmap = _dockBar.Render(s);
+        }
+        var width = _dockBitmap.Width;
+        _dockPx = new RectangleF((float)Math.Round(body.X + body.Width / 2 - width / 2f), (float)Math.Round(body.Bottom + DockBar.Gap * s), width, _dockBitmap.Height);
+        DrawFaded(g, _dockBitmap, _dockPx, alpha);
     }
 
     private void DrawContent(Graphics g, RectangleF body, float radius, float lift)
@@ -768,9 +843,12 @@ internal sealed class UsageIsland : IDisposable
             if (pageSwitch)
             {
                 // The header is the new page's from the first frame; only the body cross-fades.
-                g.CompositingMode = CompositingMode.SourceCopy;
-                g.DrawImage(bitmap, new Rectangle((int)origin.X, (int)origin.Y, bitmap.Width, headerPx), 0, 0, bitmap.Width, headerPx, GraphicsUnit.Pixel);
-                g.CompositingMode = CompositingMode.SourceOver;
+                if (headerPx > 0)
+                {
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    g.DrawImage(bitmap, new Rectangle((int)origin.X, (int)origin.Y, bitmap.Width, headerPx), 0, 0, bitmap.Width, headerPx, GraphicsUnit.Pixel);
+                    g.CompositingMode = CompositingMode.SourceOver;
+                }
                 if (alpha > 0.004)
                     DrawFaded(g, bitmap, new RectangleF(origin.X, origin.Y + headerPx, bitmap.Width, bitmap.Height - headerPx), alpha,
                         new RectangleF(0, headerPx, bitmap.Width, bitmap.Height - headerPx));
@@ -902,6 +980,7 @@ internal sealed class UsageIsland : IDisposable
         _shown = false;
         _surface = null;
         _bodyPx = RectangleF.Empty;
+        _dockPx = RectangleF.Empty;
         _wheel = 0;
         DisposeBitmaps();
         _canvas?.Dispose();
@@ -911,6 +990,9 @@ internal sealed class UsageIsland : IDisposable
 
     private void DisposeBitmaps()
     {
+        _dockBitmap?.Dispose();
+        _dockBitmap = null;
+        _dockKey = default;
         _contentBlur.Dispose();
         _ghostBlur.Dispose();
         _contentBitmap?.Dispose();
@@ -923,10 +1005,69 @@ internal sealed class UsageIsland : IDisposable
 
     private void SetInteractive(bool interactive) => _window?.SetInteractive(interactive);
 
-    private bool HitBody(Point client) => _bodyPx.Contains(client);
+    private bool HitBody(Point client) => _bodyPx.Contains(client) || (DockActive && OverDock(client));
+
+    /// <summary>Over the Dock or the gap between it and the body (crossing the gap must not leave the island).</summary>
+    private bool OverDock(Point client) => _dockPx.Contains(client) ||
+        new RectangleF(_dockPx.X, _bodyPx.Bottom, _dockPx.Width, Math.Max(0, _dockPx.Top - _bodyPx.Bottom)).Contains(client);
+
+    /// <summary>Handles the pointer over the Dock; true when the message was for it and the surface need not see it.</summary>
+    private bool OnDockMouse(int message, Point client)
+    {
+        if (!DockActive) return false;
+        var item = message is 0x0200 or 0x0201 && _dockPx.Contains(client)
+            ? _dockBar.ItemAt(new PointF((client.X - _dockPx.X) / _scale, (client.Y - _dockPx.Y) / _scale))
+            : -1;
+        if (message is 0x0200 or 0x02A3 && item != _dockBar.Hover)
+        {
+            _dockBar.Hover = item;
+            Present(releaseCanvas: false);
+        }
+        if (message == 0x0201 && item >= 0)
+        {
+            Interacted?.Invoke();
+            DockClicked(item);
+            return true;
+        }
+        if (message != 0x0200 || !OverDock(client)) return false;
+        // moving over the Dock: the surface's own hover goes
+        if (_surface is PanelSurface panel && (panel.Hover is not null || panel.HoverRow != -1))
+        {
+            panel.Hover = null;
+            panel.HoverRow = -1;
+            Refresh();
+        }
+        else if (_surface is ProgressSurface card && (card.Hover != ProgressHit.None || card.HoverIndex >= 0))
+        {
+            card.Hover = ProgressHit.None;
+            card.HoverIndex = -1;
+            Refresh();
+        }
+        return true;
+    }
+
+    private void DockClicked(int item)
+    {
+        switch (item)
+        {
+            case DockBar.Home:
+                if (_surface is not ProgressSurface { Menu: true }) OpenCard(null, menu: true, focus: null);
+                break;
+            case DockBar.Settings:
+                if (_surface == _panel) SetPage(_panel.Page == PanelSurface.SettingsPage ? _returnPage : PanelSurface.SettingsPage);
+                else ShowSettings();
+                break;
+            default:
+                if (_surface == _panel) SetPage(item - 1);
+                else ShowPage(item - 1);
+                break;
+        }
+        _dockBar.Hover = -1;
+    }
 
     private void OnMouse(int message, Point client, int delta)
     {
+        if (OnDockMouse(message, client)) return;
         if (_surface is ProgressSurface card)
         {
             // The card answers its buttons, the two tabs and the pager (dots and wheel). Opened as a notice it goes away with the
@@ -936,10 +1077,10 @@ internal sealed class UsageIsland : IDisposable
             {
                 case 0x0200 when _shown: // WM_MOUSEMOVE
                     var over = card.HitAt(spot, out var overDot);
-                    if (over != card.Hover || overDot != card.HoverDot)
+                    if (over != card.Hover || overDot != card.HoverIndex)
                     {
                         card.Hover = over;
-                        card.HoverDot = overDot;
+                        card.HoverIndex = overDot;
                         Refresh();
                     }
                     break;
@@ -955,6 +1096,13 @@ internal sealed class UsageIsland : IDisposable
                         case ProgressHit.ProgressTab: SetCardTab(card, ProgressSurface.ProgressPage); break;
                         case ProgressHit.UsageTab: SetCardTab(card, ProgressSurface.UsagePage); break;
                         case ProgressHit.Dot: SetCardPage(card, dot); break;
+                        case ProgressHit.Row:
+                            if (card.Open(dot)) OpenViewed(card);
+                            break;
+                        case ProgressHit.Back:
+                            card.CloseViewed();
+                            OpenViewed(card);
+                            break;
                     }
                     break;
                 case 0x020A when _shown && card.Page == ProgressSurface.ProgressPage && card.PageCount > 1: // WM_MOUSEWHEEL
@@ -967,10 +1115,10 @@ internal sealed class UsageIsland : IDisposable
                     }
                     break;
                 case 0x02A3 when _shown: // WM_MOUSELEAVE
-                    if (card.Hover != ProgressHit.None || card.HoverDot >= 0)
+                    if (card.Hover != ProgressHit.None || card.HoverIndex >= 0)
                     {
                         card.Hover = ProgressHit.None;
-                        card.HoverDot = -1;
+                        card.HoverIndex = -1;
                         Refresh();
                     }
                     if (!card.Menu) DetailLeft?.Invoke();
@@ -1061,62 +1209,100 @@ internal sealed class UsageIsland : IDisposable
         switch (message)
         {
             case 0x0200: // WM_MOUSEMOVE
-                var hover = panel.TabAt(point);
+                var hit = panel.HitAt(point);
                 var hoverRow = panel.SettingRowAt(point);
-                var hoverGear = panel.GearAt(point);
-                var hoverRange = panel.RangeAt(point);
-                var hoverBack = PanelSurface.BackAt(point);
-                if (hover != panel.HoverTab || hoverRow != panel.HoverRow || hoverGear != panel.HoverGear || hoverRange != panel.HoverRange || hoverBack != panel.HoverBackButton)
+                if (hit != panel.Hover || hoverRow != panel.HoverRow)
                 {
-                    panel.HoverTab = hover;
+                    panel.Hover = hit;
                     panel.HoverRow = hoverRow;
-                    panel.HoverGear = hoverGear;
-                    panel.HoverRange = hoverRange;
-                    panel.HoverBackButton = hoverBack;
                     Refresh();
+                }
+                if (_press is { } held && (Control.MouseButtons & MouseButtons.Left) != 0 &&
+                    Math.Abs(point.X - held.Point.X) + Math.Abs(point.Y - held.Point.Y) > 8)
+                {
+                    _press = null;
+                    DragFileOut(panel, held.Hit.Index);
                 }
                 break;
             case 0x02A3: // WM_MOUSELEAVE
-                if (panel.HoverTab != -1 || panel.HoverRow != -1 || panel.HoverGear || panel.HoverRange != -1 || panel.HoverBackButton)
+                _press = null;
+                if (panel.Hover is not null || panel.HoverRow != -1)
                 {
-                    panel.HoverTab = -1;
+                    panel.Hover = null;
                     panel.HoverRow = -1;
-                    panel.HoverGear = false;
-                    panel.HoverRange = -1;
-                    panel.HoverBackButton = false;
                     Refresh();
                 }
                 break;
             case 0x0201: // WM_LBUTTONDOWN
-                if (PanelSurface.BackAt(point))
+                Interacted?.Invoke();
+                if (panel.HitAt(point) is { } click)
                 {
-                    Interacted?.Invoke();
-                    panel.HoverBackButton = false;
-                    OpenCard(null, menu: true, focus: null);
+                    if (click.Action == PanelAction.FileOpen) _press = (click, point); // opened on release, unless it was dragged away
+                    else PerformPanel(panel, click);
                 }
-                else if (panel.TargetAt(panel.SettingRowAt(point)) is { } session)
+                else if (panel.SettingAt(point) is { } change) SettingChanged?.Invoke(change.Row.Id, change.Value);
+                break;
+            case 0x0202: // WM_LBUTTONUP
+                if (_press is { } release)
                 {
-                    Interacted?.Invoke();
-                    SessionRequested?.Invoke(session);
-                }
-                else if (panel.GearAt(point)) SetPage(panel.Page == PanelSurface.SettingsPage ? _returnPage : PanelSurface.SettingsPage);
-                else if (panel.TabAt(point) is >= 0 and var tab) SetPage(tab);
-                else if (panel.RangeAt(point) is >= 0 and var range) SetHistoryRange(panel, range == 1);
-                else if (panel.SettingAt(point) is { } change)
-                {
-                    Interacted?.Invoke();
-                    SettingChanged?.Invoke(change.Row.Id, change.Value);
+                    _press = null;
+                    if (panel.HitAt(point) == release.Hit) PerformPanel(panel, release.Hit);
                 }
                 break;
-            case 0x020A: // WM_MOUSEWHEEL
+            case 0x020A: // WM_MOUSEWHEEL: turns the calendar's months
                 _wheel += delta;
                 if (Math.Abs(_wheel) >= 120)
                 {
-                    if (panel.Page != PanelSurface.SettingsPage) SetPage(Math.Clamp(panel.Page + (_wheel < 0 ? 1 : -1), 0, PanelSurface.SettingsPage - 1));
+                    if (panel.ScrollMonth(_wheel < 0 ? 1 : -1))
+                    {
+                        Interacted?.Invoke();
+                        Refresh();
+                    }
                     _wheel = 0;
                 }
                 break;
         }
+    }
+
+    private void PerformPanel(PanelSurface panel, PanelHit hit)
+    {
+        switch (panel.Activate(hit))
+        {
+            case PanelResult.PageChanged:
+                _returnPage = panel.Page;
+                Display(panel, null, crossfade: true);
+                break;
+            case PanelResult.Redraw:
+                Refresh();
+                break;
+            case PanelResult.PromptTask:
+                TaskPromptRequested?.Invoke(panel.PromptDue);
+                break;
+        }
+        if (panel.Flash is null) return;
+        _flashTimer.Stop();
+        _flashTimer.Start();
+    }
+
+    /// <summary>Takes a file of the tray out of the island: the drag goes on in the system until it is dropped somewhere.</summary>
+    private void DragFileOut(PanelSurface panel, int index)
+    {
+        if (panel.FileAt(index) is not { } path || !(File.Exists(path) || Directory.Exists(path))) return;
+        Interacted?.Invoke();
+        _dragHost ??= new Control();
+        _ = _dragHost.Handle; // the drag needs a window of this thread to run its loop on
+        _dragHost.DoDragDrop(new DataObject(DataFormats.FileDrop, new[] { path }), DragDropEffects.Copy | DragDropEffects.Link);
+    }
+
+    private void SetPage(int page)
+    {
+        page = Math.Clamp(page, 0, PanelSurface.SettingsPage);
+        if (page == _panel.Page) return;
+        if (page == PanelSurface.SettingsPage) _returnPage = _panel.Page;
+        _panel.Page = page;
+        _panel.Hover = null;
+        _panel.Flash = null;
+        Display(_panel, null, crossfade: true);
     }
 
     /// <summary>Switches the card between 進捗 and 使用状況; the main menu remembers the tab it was left on.</summary>
@@ -1144,33 +1330,12 @@ internal sealed class UsageIsland : IDisposable
         Display(detail, null, crossfade: true);
     }
 
-    /// <summary>Switches the history chart between the 5-hour and weekly windows; the curves draw in again.</summary>
-    private void SetHistoryRange(PanelSurface panel, bool weekly)
+    /// <summary>Redraws the card after a finished turn was opened from its list, or closed back to it.</summary>
+    private void OpenViewed(ProgressSurface card)
     {
-        Interacted?.Invoke();
-        if (panel.HistoryWeekly == weekly) return;
-        panel.HistoryWeekly = weekly;
-        if (_animate)
-        {
-            _meter.Jump(0);
-            _meter.To(1, Motion.Fill);
-            StartFrames();
-        }
-        Refresh();
-    }
-
-    private void SetPage(int page)
-    {
-        page = Math.Clamp(page, 0, PanelSurface.PageCount - 1);
-        Interacted?.Invoke();
-        if (page == _panel.Page) return;
-        if (page == PanelSurface.SettingsPage) _returnPage = _panel.Page;
-        _panel.Page = page;
-        _panel.HoverTab = -1;
-        _panel.HoverRow = -1;
-        _panel.HoverRange = -1;
-        AimTab(snap: false);
-        Display(_panel, null, crossfade: true);
+        card.Hover = ProgressHit.None;
+        card.HoverIndex = -1;
+        Display(card, null, crossfade: true);
     }
 
     public void Dispose()
@@ -1178,7 +1343,9 @@ internal sealed class UsageIsland : IDisposable
         StopFrames();
         DisposeBitmaps();
         _canvas?.Dispose();
+        if (_window is not null) FileDropTarget.Revoke(_window.Handle);
         _window?.DestroyHandle();
+        _flashTimer.Dispose();
         _style.Dispose();
     }
 
@@ -1205,6 +1372,7 @@ internal sealed class UsageIsland : IDisposable
                 Style = unchecked((int)0x80000000), // WS_POPUP
                 ExStyle = 0x00080000 | ExTransparent | 0x00000080 | 0x08000000 | 0x00000008 // LAYERED, TRANSPARENT, TOOLWINDOW, NOACTIVATE, TOPMOST
             });
+            FileDropTarget.Register(Handle, owner._drop);
         }
 
         public void ShowTopmost()
@@ -1252,7 +1420,7 @@ internal sealed class UsageIsland : IDisposable
                 case 0x0021: // WM_MOUSEACTIVATE
                     message.Result = new IntPtr(3); // MA_NOACTIVATE
                     return;
-                case 0x0200 or 0x0201 or 0x02A3:
+                case 0x0200 or 0x0201 or 0x0202 or 0x02A3:
                     if (message.Msg == 0x0200 && !_tracking)
                     {
                         var track = new TRACKMOUSEEVENT { Size = Marshal.SizeOf<TRACKMOUSEEVENT>(), Flags = 2, Window = Handle };

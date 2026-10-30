@@ -32,7 +32,6 @@ internal readonly record struct Move(Tuning Spring, bool Floor);
 /// <item><term>Rise</term><description>vertical position and hover lift</description></item>
 /// <item><term>Fade</term><description>every opacity: content, outgoing content, window</description></item>
 /// <item><term>Slide</term><description>tab highlight, gear, switch knobs</description></item>
-/// <item><term>Fill</term><description>meters and the history chart drawing in (never overshoots 100 %)</description></item>
 /// </list>
 /// </summary>
 internal static class Motion
@@ -52,9 +51,8 @@ internal static class Motion
     public static readonly Move Page = new(FromSwiftUI(0.45, 0.35), Floor: false);
     public static readonly Move Rise = new(new(300, 34.6), Floor: true);
     public static readonly Move Fade = new(new(700, 52.9), Floor: true);
-    // Not from Oyenza: tab indicator (zeta 0.75, a hair of overshoot) and meter fill (critical, never overshoots 100 %).
+    // Not from Oyenza: switch knobs (zeta 0.75, a hair of overshoot).
     public static readonly Move Slide = new(new(520, 34.2), Floor: false);
-    public static readonly Move Fill = new(new(90, 19.0), Floor: false);
 
     /// <summary>Seconds the content waits for the shape before it fades in: a growing shape is read sooner than a shrinking one.</summary>
     public const double GrowDelay = 0.03, ShrinkDelay = 0.05;
