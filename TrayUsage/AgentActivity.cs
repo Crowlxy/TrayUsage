@@ -54,6 +54,7 @@ internal sealed partial class ActivityMonitor
         public string? CodexProject;
         public string Path = "";
         public bool HeaderRead;
+        public bool Registered; // seen in Claude Code's own session registry, so a missing entry later means the session ended
     }
 
     private sealed class TurnState
@@ -112,6 +113,7 @@ internal sealed partial class ActivityMonitor
             catch (UnauthorizedAccessException) { tracked.Length = -1; }
         }
         foreach (var gone in _tracked.Keys.Where(key => !seen.Contains(key)).ToList()) _tracked.Remove(gone);
+        CloseEndedTurns();
 
         var running = _tracked.Values
             .Where(t => t is { Skip: false, State.Running: true })
@@ -119,6 +121,66 @@ internal sealed partial class ActivityMonitor
             .OrderBy(s => s.StartedAt)
             .ToList();
         return new(running, completed, asked, readLarge);
+    }
+
+    // A cancelled send and a closed terminal leave a turn open in the log (nothing is written for either), so the log alone
+    // cannot end it. Claude Code's session registry (~/.claude/sessions/<pid>.json) can: it holds the live status and the pid.
+    private static readonly TimeSpan SettleTime = TimeSpan.FromSeconds(3);
+
+    private void CloseEndedTurns()
+    {
+        if (!_tracked.Values.Any(t => t is { Skip: false, Kind: AgentKind.Claude, State.Running: true })) return;
+        var registry = ClaudeRegistry();
+        foreach (var tracked in _tracked.Values)
+        {
+            if (tracked is not { Skip: false, Kind: AgentKind.Claude, State: { } state }) continue;
+            var found = registry.TryGetValue(System.IO.Path.GetFileNameWithoutExtension(tracked.Path), out var entry);
+            if (found) tracked.Registered = true;
+            if (!state.Running || (!found && !tracked.Registered)) continue; // logs of older versions or the SDK have no entry: the log decides
+            // "idle" is only believed once the log has been quiet for a moment, so a turn that just finished is still reported as finished.
+            var ended = !found || !entry.Alive || (entry.Idle && DateTime.UtcNow - tracked.LastWriteUtc > SettleTime);
+            if (!ended) continue;
+            state.Running = false;
+            state.QuestionId = null;
+            state.End = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private readonly record struct RegistryEntry(bool Alive, bool Idle);
+
+    private static Dictionary<string, RegistryEntry> ClaudeRegistry()
+    {
+        var result = new Dictionary<string, RegistryEntry>(StringComparer.OrdinalIgnoreCase);
+        var directory = Path.Combine(
+            Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") is { Length: > 0 } dir
+                ? dir : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude"), "sessions");
+        if (!Directory.Exists(directory)) return result;
+        foreach (var file in Directory.EnumerateFiles(directory, "*.json"))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(file));
+                var root = doc.RootElement;
+                if (Str(root, "sessionId") is not { } id || !root.TryGetProperty("pid", out var pidNode) || !pidNode.TryGetInt32(out var pid)) continue;
+                long.TryParse(Str(root, "procStart"), out var started);
+                result[id] = new(IsAlive(pid, started), Str(root, "status") == "idle");
+            }
+            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
+        }
+        return result;
+    }
+
+    /// <summary>The process exists and is the one that wrote the entry (a reused pid has a different start time).</summary>
+    private static bool IsAlive(int pid, long startedFileTime)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited && (startedFileTime == 0 || Math.Abs(process.StartTime.ToFileTime() - startedFileTime) < TimeSpan.TicksPerSecond * 2);
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return true; } // cannot be inspected: do not hide a session over it
     }
 
     private readonly record struct Candidate(string Path, long Length, DateTime LastWriteUtc, AgentKind Kind);
