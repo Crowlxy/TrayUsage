@@ -455,11 +455,11 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
     private const float ListWidth = 500, HistoryWidth = 600, SettingsWidth = 560;
     public static float MaxWidth => Math.Max(ListWidth, Math.Max(HistoryWidth, SettingsWidth));
     public float Width => Page switch { DonePage => ListWidth, HistoryPage => HistoryWidth, _ => SettingsWidth };
-    public const int MaxSettingRows = 11;
+    public const int MaxSettingRows = 12;
     private const int MaxRows = 5;
     // Settings: rows of two columns under group headings. MaxSettingsHeight is what the canvas reserves; the layout asserts it fits.
     private const float SettingRowHeight = 36, GroupHeaderHeight = 30, GroupGap = 10, SettingsTop = 10, SettingsBottom = 16, SettingsPad = 24, ColumnGap = 32;
-    private const float SwitchWidth = 38, SwitchHeight = 22, SegmentHeight = 24, MaxSettingsHeight = 330;
+    private const float SwitchWidth = 38, SwitchHeight = 22, SegmentHeight = 24, MaxSettingsHeight = 360;
     private const float TabHeight = 30, TabGap = 8, TabPad = 14, TabLeft = 52, TabTop = 9, RightPad = 28;
     // History chart: plot box inside the page, and the number of columns the curve is reduced to.
     private const float PlotLeft = 56, PlotTop = 58, PlotHeight = 136, ChipHeight = 24, ChipTop = 14, ChartColumns = 400;

@@ -166,6 +166,7 @@ internal sealed class UsageIsland : IDisposable
     public bool ShowingDetail => _shown && _surface is DetailSurface or ProgressSurface { Menu: false };
 
     private bool WantsHand => _shown && (_surface is NoticeSurface or DetailSurface or IdleSurface ||
+        _surface is AskSurface { Hover: not AskHit.None } ||
         _surface is ProgressSurface { } card && (card.Hover != ProgressHit.None || card.HoverDot >= 0) ||
         _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverBackButton || p.HoverRow >= 0 || p.HoverRange >= 0));
 
@@ -199,6 +200,16 @@ internal sealed class UsageIsland : IDisposable
 
     /// <summary>A click on the resting pill: the owner opens the main menu.</summary>
     public event Action? PillClicked;
+
+    /// <summary>The user answered (or handed back) the approval or question on the island.</summary>
+    public event Action<AskRequest, AskReply>? AskReplied;
+
+    /// <summary>Shows an approval or a question that a hook is waiting on; the one already in view is left alone.</summary>
+    public void ShowAsk(AskRequest request)
+    {
+        if (_shown && _surface is AskSurface current && current.Request.Id == request.Id) return;
+        Display(new AskSurface(_style, request), null, crossfade: Visible && _shown);
+    }
 
     /// <summary>
     /// The resting pill of the Pill theme: a small capsule that stays up while nothing else is shown, with a ring that fills with
@@ -418,7 +429,7 @@ internal sealed class UsageIsland : IDisposable
         _surface = surface;
         _shown = true;
         UpdateSpin();
-        SetGlow(surface, pulse: previous != surface && surface is NoticeSurface);
+        SetGlow(surface, pulse: previous != surface && surface is NoticeSurface or AskSurface);
         // opening bounces, morphing between surfaces is snappy, another page of the same surface swings past on the way in as well
         var morph = !wasVisible ? Motion.Open : crossfade && previous == surface ? Motion.Page : Motion.Morph;
         _w.To(size.Width, morph);
@@ -469,6 +480,11 @@ internal sealed class UsageIsland : IDisposable
                 _glowColor = NoticeLook.Accent(notice.Data);
                 _glowRest = 0.3f;
                 _glowDouble = notice.Type is NoticeType.Warning or NoticeType.Exhausted or NoticeType.Approval;
+                break;
+            case AskSurface ask:
+                _glowColor = ask.Request.IsQuestion ? NoticeLook.Question : NoticeLook.Approval;
+                _glowRest = 0.3f;
+                _glowDouble = !ask.Request.IsQuestion;
                 break;
             case DetailSurface { Data.Type: not NoticeType.Running } detail:
                 _glowColor = NoticeLook.Accent(detail.Data);
@@ -958,6 +974,44 @@ internal sealed class UsageIsland : IDisposable
                         Refresh();
                     }
                     if (!card.Menu) DetailLeft?.Invoke();
+                    break;
+            }
+            return;
+        }
+        if (_surface is AskSurface ask)
+        {
+            var spot = new PointF((client.X - _contentOrigin.X) / _scale, (client.Y - _contentOrigin.Y) / _scale);
+            switch (message)
+            {
+                case 0x0200 when _shown: // WM_MOUSEMOVE
+                    var over = ask.HitAt(spot, out var overOption);
+                    if (over != ask.Hover || overOption != ask.HoverOption)
+                    {
+                        ask.Hover = over;
+                        ask.HoverOption = overOption;
+                        Refresh();
+                    }
+                    break;
+                case 0x02A3 when _shown: // WM_MOUSELEAVE
+                    if (ask.Hover != AskHit.None)
+                    {
+                        ask.Hover = AskHit.None;
+                        ask.HoverOption = -1;
+                        Refresh();
+                    }
+                    break;
+                case 0x0201 when _shown: // WM_LBUTTONDOWN
+                    Interacted?.Invoke();
+                    switch (ask.HitAt(spot, out var option))
+                    {
+                        case AskHit.Allow: AskReplied?.Invoke(ask.Request, new("allow")); break;
+                        case AskHit.Deny: AskReplied?.Invoke(ask.Request, new("deny")); break;
+                        case AskHit.Terminal: AskReplied?.Invoke(ask.Request, new("terminal")); break;
+                        case AskHit.Option:
+                            if (ask.Choose(option)) AskReplied?.Invoke(ask.Request, new("answer", ask.Answers));
+                            else Display(ask, null, crossfade: true); // the next question
+                            break;
+                    }
                     break;
             }
             return;

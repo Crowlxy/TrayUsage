@@ -13,7 +13,7 @@ internal static class Program
         // The hook process Claude Code runs: drop an event file and leave, without starting the UI.
         if (args.Length >= 2 && args[0] == "--hook")
         {
-            HookRelay.Run(args[1]);
+            HookRelay.Run(args[1], args.Contains("--answer"));
             return;
         }
         // One tray app only (also keeps a hook started without its arguments from opening a second one).
@@ -63,6 +63,9 @@ internal sealed class UsageContext : ApplicationContext
     private IReadOnlyList<AgentSession> _running = [];
     private readonly List<CompletedTurn> _recent = [];
     private NoticeData? _alertNotice;
+    private readonly List<AskRequest> _asks = []; // approvals and questions whose hooks are waiting for the tray
+    private readonly HashSet<string> _answeredAsks = [];
+    private readonly System.Windows.Forms.Timer _askTimer = new() { Interval = 400 };
     private NoticeData? _detail; // the notice whose detail card is up
     private readonly Queue<(NoticeData Data, int Ms)> _alertQueue = new();
     private readonly QuotaWatcher _quota = new();
@@ -122,6 +125,9 @@ internal sealed class UsageContext : ApplicationContext
         _island.SettingChanged += OnIslandSetting;
         _island.NoticeClicked += OnNoticeClicked;
         _island.PillClicked += ShowPreview;
+        _island.AskReplied += OnAskReplied;
+        _askTimer.Tick += (_, _) => PollAsks();
+        _askTimer.Start();
         _island.DetailLeft += () => { if (_detail is not null) FinishAlert(); }; // a card goes away when the pointer does
         _island.MoreRequested += ShowMore; // the card's "more" button: the Done / History / Settings panel takes its place
         _island.SessionRequested += target => { if (!SessionJump.Activate(target)) ShowPreview(); };
@@ -164,6 +170,21 @@ internal sealed class UsageContext : ApplicationContext
         _activityTimer.Start();
         Application.Idle += RefreshOnFirstIdle;
         if (Environment.GetCommandLineArgs().Contains("--demo")) StartDemo();
+        if (Environment.GetCommandLineArgs().Contains("--demo-ask")) StartDemoAsk(approvalOnly: false);
+        if (Environment.GetCommandLineArgs().Contains("--demo-approval")) StartDemoAsk(approvalOnly: true);
+    }
+
+    /// <summary>--demo-ask: an approval and a question on the island, answered into nothing (no hook is waiting), to look at their layout.</summary>
+    private void StartDemoAsk(bool approvalOnly)
+    {
+        var target = Demo(AgentKind.Claude, "ask");
+        if (!approvalOnly) _asks.Add(new("demo-question", true, AgentKind.Claude, "TrayUsage", null, null,
+        [
+            new("How should the new settings page open?", "Settings", [new("In the current window", "Replaces what is on screen"), new("In a separate window", "Opens beside it"), new("As a panel", null)]),
+            new("Which theme should it start in?", "Theme", [new("Classic", null), new("Pill", null)])
+        ], target));
+        _asks.Add(new("demo-approval", false, AgentKind.Claude, "TrayUsage", "Bash", "dotnet publish TrayUsage/TrayUsage.csproj -c Release -r win-x64 --no-self-contained -o dist", [], target));
+        UpdateActivityIsland();
     }
 
     // The sessions --demo shows as running, so the card's pager has pages to turn.
@@ -272,7 +293,12 @@ internal sealed class UsageContext : ApplicationContext
         var delay = ActivitySettings.GetInt(ActivitySettings.HoverDelayMs, 220);
         var startup = false;
         var hookInstalled = false;
-        try { hookInstalled = HookInstaller.IsInstalled(); }
+        var answerMode = false;
+        try
+        {
+            hookInstalled = HookInstaller.IsInstalled();
+            answerMode = hookInstalled && HookInstaller.IsAnswerMode();
+        }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
         try { startup = StartupRegistration.IsEnabled(); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
@@ -283,6 +309,7 @@ internal sealed class UsageContext : ApplicationContext
             new("question", "通知", "質問待ちを通知", [], Flag(ActivitySettings.NotifyQuestion)),
             new("quota", "通知", "使用量の警告・リセットを通知", [], Flag(ActivitySettings.NotifyQuota)),
             new("hook", "通知", "承認待ちを通知 (Hook)", [], hookInstalled ? 1 : 0),
+            new("answer", "通知", "トレイから承認・質問に答える (Hook)", [], answerMode ? 1 : 0),
             new("fullscreen", "通知", "全画面アプリ中は通知しない", [], Flag(ActivitySettings.FullscreenQuiet)),
             new("theme", "表示", "テーマ", ["Classic", "Pill"], Math.Clamp(ActivitySettings.GetInt(ActivitySettings.Theme, 0), 0, Themes.Length - 1)),
             new("clock", "表示", "時計を表示", [], Flag(ActivitySettings.ShowClock)),
@@ -308,6 +335,18 @@ internal sealed class UsageContext : ApplicationContext
                 {
                     if (value != 0) HookInstaller.Install();
                     else HookInstaller.Uninstall();
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+                {
+                    MessageBox.Show($"Hook を変更できませんでした。\n{ex.Message}", "Tray Usage", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                break;
+            case "answer":
+                // Answering needs hooks that wait for the tray; off keeps the observe-only ones (or none, if they were never installed).
+                try
+                {
+                    if (value != 0) HookInstaller.Install(answer: true);
+                    else if (HookInstaller.IsInstalled()) HookInstaller.Install(answer: false);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
                 {
@@ -391,7 +430,11 @@ internal sealed class UsageContext : ApplicationContext
             if (notify && announce.Count > 0) PostAlert(DoneNotice(announce[^1]), announce[^1].Duration >= LongTurn ? 9000 : 4500);
             if (question)
                 foreach (var asked in snapshot.Asked)
+                {
+                    // A question the tray can answer is already on the island, as buttons.
+                    if (asked.Reason == AskReason.Question && _asks.Any(ask => ask.IsQuestion && SameSession(ask.Target, asked.Target))) continue;
                     PostAlert(AskedNotice(asked), 8000);
+                }
             UpdateActivityIsland();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or ArgumentException)
@@ -449,6 +492,14 @@ internal sealed class UsageContext : ApplicationContext
     private bool UpdateActivityIsland()
     {
         if (_usageShown || _detail is not null) return true; // the panel (or a detail card) owns the island until it is dismissed
+        if (_asks.Count > 0)
+        {
+            // A hook is waiting for the answer, so it comes before every notice, and the full-screen quiet does not hide it: the agent is
+            // blocked until the hook gives up.
+            _spinTimer.Stop();
+            _island.ShowAsk(_asks[0]);
+            return true;
+        }
         if (ActivitySettings.Get(ActivitySettings.FullscreenQuiet) && FullscreenGuard.IsForegroundFullscreen())
         {
             _spinTimer.Stop();
@@ -548,6 +599,50 @@ internal sealed class UsageContext : ApplicationContext
     /// <summary>What a running session has been doing, looked up by its id (a hook event carries no log details).</summary>
     private SessionBrief? BriefOf(SessionTarget? target) =>
         target?.SessionId is { } id ? _running.FirstOrDefault(s => s.Target?.SessionId == id)?.Brief : null;
+
+    private static bool SameSession(SessionTarget? a, SessionTarget? b) => a?.SessionId is { } id && id == b?.SessionId;
+
+    /// <summary>Takes the hooks' waiting requests into <see cref="_asks"/> and drops those whose hook has gone.</summary>
+    private void PollAsks()
+    {
+        if (_disposed) return;
+        var live = AskInbox.Poll();
+        var changed = false;
+        foreach (var request in live)
+        {
+            if (_asks.Any(ask => ask.Id == request.Id) || _answeredAsks.Contains(request.Id)) continue;
+            _asks.Add(request);
+            changed = true;
+            if (request.IsQuestion) DropQuestionNotices(request.Target);
+        }
+        // A demo request has no hook behind it, so it never goes away by itself.
+        changed |= _asks.RemoveAll(ask => AskInbox.IsValidId(ask.Id) && live.All(item => item.Id != ask.Id)) > 0;
+        if (_answeredAsks.Count > 50) _answeredAsks.Clear();
+        if (changed) UpdateActivityIsland();
+    }
+
+    /// <summary>The notice the log raised for a question the tray is now asking is the same question: it is not shown twice.</summary>
+    private void DropQuestionNotices(SessionTarget target)
+    {
+        if (_alertNotice is { Type: NoticeType.Question } current && SameSession(current.Target, target))
+        {
+            _alertNotice = null;
+            _doneTimer.Stop();
+        }
+        var kept = _alertQueue.Where(item => !(item.Data.Type == NoticeType.Question && SameSession(item.Data.Target, target))).ToList();
+        if (kept.Count == _alertQueue.Count) return;
+        _alertQueue.Clear();
+        foreach (var item in kept) _alertQueue.Enqueue(item);
+    }
+
+    private void OnAskReplied(AskRequest request, AskReply reply)
+    {
+        _asks.RemoveAll(ask => ask.Id == request.Id);
+        _answeredAsks.Add(request.Id);
+        AskInbox.Reply(request.Id, reply);
+        if (reply.Action == "terminal" && !SessionJump.Activate(request.Target)) ShowPreview();
+        UpdateActivityIsland();
+    }
 
     private void FinishAlert()
     {
