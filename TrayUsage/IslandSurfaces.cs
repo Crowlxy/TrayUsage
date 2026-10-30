@@ -152,8 +152,12 @@ internal sealed class NoticeSurface : IslandSurface
         _width = MeasureWidth();
     }
 
-    // A running or finished turn rests as a slim pill: the logo, the time, and the state (a spinner, or a green check).
-    private const float CompactWidth = 148, CompactHeight = 40, CompactInset = 12, StateSize = 22, CompactLogo = 24;
+    // A running or finished turn rests as a slim pill: the logo, the time, and the state (a spinner, or a green check), evenly
+    // spaced. The time sits in a slot as wide as "00:00", so the pill does not change width as the digits tick.
+    private const float CompactHeight = 40, CompactInset = 14, CompactGap = 10, StateSize = 22, CompactLogo = 24;
+    private float _compactWidth, _timeSlot;
+    private float CompactWidth => _compactWidth;
+    private float StateX => CompactWidth - CompactInset - StateSize;
 
     public NoticeType Type => _data.Type;
     public NoticeData Data => _data;
@@ -162,7 +166,7 @@ internal sealed class NoticeSurface : IslandSurface
     public override float Radius => (Compact ? CompactHeight : Height) / 2;
 
     public override IReadOnlyList<(RectangleF Rect, Color Color)> LiveSpinners => _data.Type == NoticeType.Running
-        ? [(new RectangleF(CompactWidth - CompactInset - StateSize, (CompactHeight - StateSize) / 2, StateSize, StateSize), Agent.Accent(_data.Kind))] : [];
+        ? [(new RectangleF(StateX, (CompactHeight - StateSize) / 2, StateSize, StateSize), Agent.Accent(_data.Kind))] : [];
 
     public void Update(NoticeData data)
     {
@@ -172,6 +176,9 @@ internal sealed class NoticeSurface : IslandSurface
 
     private float MeasureWidth()
     {
+        _timeSlot = Math.Max(_style.MeasureWidth("00:00", _style.Body), _style.MeasureWidth(_data.Trailing, _style.Body));
+        _compactWidth = (float)Math.Ceiling(CompactInset * 2 + CompactLogo + CompactGap + _timeSlot + CompactGap + StateSize);
+        _compactWidth += _compactWidth % 2; // even DIPs, so the middle is a whole pixel
         var words = Math.Max(_style.MeasureWidth(_data.Title, _style.Name), _style.MeasureWidth(_data.Subtitle, _style.Caption));
         var trailing = _data.Trailing.Length == 0 ? 0 : _style.MeasureWidth(_data.Trailing, _style.Body) + TrailGap;
         var width = (float)Math.Ceiling(TextX + words + trailing + EndGap);
@@ -184,10 +191,11 @@ internal sealed class NoticeSurface : IslandSurface
         using (g)
         {
             g.DrawImage(style.Icon(_data.Kind), new RectangleF(CompactInset, (CompactHeight - CompactLogo) / 2, CompactLogo, CompactLogo));
-            IslandStyle.Text(g, _data.Trailing, style.Body, IslandStyle.Secondary, CompactInset + CompactLogo + 10, CompactHeight / 2 + 4.5f);
+            IslandStyle.Text(g, _data.Trailing, style.Body, IslandStyle.Secondary,
+                CompactInset + CompactLogo + CompactGap + (_timeSlot - style.MeasureWidth(_data.Trailing, style.Body)) / 2, CompactHeight / 2 + 4.5f);
             if (_data.Type == NoticeType.Completed) // a working turn's spinner is drawn live by the island
             {
-                var disc = new RectangleF(CompactWidth - CompactInset - StateSize, (CompactHeight - StateSize) / 2, StateSize, StateSize);
+                var disc = new RectangleF(StateX, (CompactHeight - StateSize) / 2, StateSize, StateSize);
                 using (var fill = new SolidBrush(IslandStyle.Success)) g.FillEllipse(fill, disc);
                 NoticeLook.DrawGlyph(g, style, disc, NoticeType.Completed);
             }
