@@ -27,6 +27,8 @@ internal static class Motion
     public static readonly Tuning Bouncy = FromSwiftUI(0.4, 0.3);
     public static readonly Tuning Smooth = FromSwiftUI(0.4, 0);
     public static readonly Tuning Snappy = FromSwiftUI(0.4, 0.15);
+    // Not from SwiftUI's presets: a page switch inside one surface. Snappy overshoots only 0.6 %, too little to see on a tab change.
+    public static readonly Tuning Page = FromSwiftUI(0.45, 0.35);
     public static readonly Tuning Top = new(300, 34.6);
     public static readonly Tuning Fade = new(700, 52.9);
     // Not from Oyenza: tab indicator (zeta 0.75, a hair of overshoot) and meter fill (critical, never overshoots 100 %).

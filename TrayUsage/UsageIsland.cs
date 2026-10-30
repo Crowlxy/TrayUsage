@@ -304,10 +304,21 @@ internal sealed class UsageIsland : IDisposable
         _shown = true;
         UpdateSpin();
         SetGlow(surface, pulse: previous != surface && surface is NoticeSurface);
-        var morph = wasVisible ? Motion.Snappy : Motion.Bouncy; // opening bounces, morphing between surfaces is snappy
-        _w.Retarget(size.Width, morph, morph);
-        _h.Retarget(size.Height, morph, morph);
-        _r.Retarget(surface.Radius, morph, morph);
+        var pageSwitch = wasVisible && crossfade && previous == surface;
+        var morph = pageSwitch ? Motion.Page : wasVisible ? Motion.Snappy : Motion.Bouncy; // opening bounces, morphing between surfaces is snappy
+        if (pageSwitch)
+        {
+            // SwiftUI's conversion spring has no shrink floor, so a page switch overshoots on the way in as well
+            _w.Aim(size.Width, morph);
+            _h.Aim(size.Height, morph);
+            _r.Aim(surface.Radius, morph);
+        }
+        else
+        {
+            _w.Retarget(size.Width, morph, morph);
+            _h.Retarget(size.Height, morph, morph);
+            _r.Retarget(surface.Radius, morph, morph);
+        }
         _top.Retarget(RestTop, Motion.Top, Motion.Top);
         _presence.Retarget(1, Motion.Fade, Motion.Fade);
         if (_contentAlpha.Value < 1 || crossfade)
