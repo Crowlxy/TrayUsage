@@ -113,8 +113,8 @@ internal static class NoticeLook
     }
 }
 
-/// <summary>One line of the settings page. No <paramref name="Options"/> means an on/off switch (Selected is 0 or 1).</summary>
-internal sealed record SettingRow(string Id, string Label, string[] Options, int Selected);
+/// <summary>One line of the settings page, listed under the heading <paramref name="Group"/>. No <paramref name="Options"/> means an on/off switch (Selected is 0 or 1).</summary>
+internal sealed record SettingRow(string Id, string Group, string Label, string[] Options, int Selected);
 
 /// <summary>Something the island can show. Sizes are in DIPs; <see cref="Render"/> returns an opaque black bitmap.</summary>
 internal abstract class IslandSurface
@@ -273,7 +273,7 @@ internal sealed class DetailSurface : IslandSurface
                 for (var i = 0; choices is not null && i < choices.Length; i++)
                 {
                     if (i > 0)
-                        using (var rule = new Pen(Color.FromArgb(26, 255, 255, 255), 1)) g.DrawLine(rule, TextX, top, Width - Right, top);
+                        using (var rule = new Pen(IslandStyle.Alpha2, 1)) g.DrawLine(rule, TextX, top, Width - Right, top);
                     IslandStyle.Text(g, (i + 1).ToString(), style.Caption, accent, TextX, top + 17);
                     IslandStyle.TextTrimmed(g, choices[i], style.Body, IslandStyle.Primary, TextX + 20, top + 17, textWidth - 20);
                     top += row;
@@ -322,7 +322,7 @@ internal sealed class DetailSurface : IslandSurface
     {
         var bar = new RectangleF(x, y, width, BarHeight);
         using (var path = IslandStyle.ContinuousRect(bar, BarHeight / 2))
-        using (var track = new SolidBrush(Color.FromArgb(38, 255, 255, 255))) g.FillPath(track, path);
+        using (var track = new SolidBrush(IslandStyle.Alpha3)) g.FillPath(track, path);
         using (var path = IslandStyle.ContinuousRect(bar with { Width = Math.Max(BarHeight, width * Math.Clamp(fraction, 0, 1)) }, BarHeight / 2))
         using (var fill = new SolidBrush(color)) g.FillPath(fill, path);
     }
@@ -369,7 +369,7 @@ internal sealed class DetailSurface : IslandSurface
             if (_pages.Count > 1)
                 for (var i = 0; i < _pages.Count; i++)
                 {
-                    using var dot = new SolidBrush(i == Page ? IslandStyle.Primary : Color.FromArgb(70, 255, 255, 255));
+                    using var dot = new SolidBrush(i == Page ? IslandStyle.Primary : IslandStyle.Alpha4);
                     g.FillEllipse(dot, Width / 2 + (i - (_pages.Count - 1) / 2f) * 12 - 2.5f, _height - 13, 5, 5);
                 }
         }
@@ -377,21 +377,33 @@ internal sealed class DetailSurface : IslandSurface
     }
 }
 
-/// <summary>Tabbed panel: usage (5 h / weekly meters), running sessions, finished turns, and the settings page.</summary>
+/// <summary>Tabbed panel: usage (5 h / weekly meters), running sessions, finished turns, usage history, and the settings page.</summary>
 internal sealed class PanelSurface(IslandStyle style) : IslandSurface
 {
-    public const int PageCount = 4, RunningPage = 1, DonePage = 2, SettingsPage = 3;
-    public const float Width = 420, HeaderHeight = 44, UsageHeight = 112, RowHeight = 44, BottomPad = 12;
+    public const int PageCount = 5, UsagePage = 0, RunningPage = 1, DonePage = 2, HistoryPage = 3, SettingsPage = 4;
+    public const float HeaderHeight = 48, UsageHeight = 184, RowHeight = 52, BottomPad = 14, HistoryHeight = 236;
+    // Each page is as wide as its content needs: meters and list rows are narrow, the chart and the settings columns want room.
+    private const float UsageWidth = 500, ListWidth = 500, HistoryWidth = 600, SettingsWidth = 560;
+    public static float MaxWidth => Math.Max(Math.Max(UsageWidth, ListWidth), Math.Max(HistoryWidth, SettingsWidth));
+    public float Width => Page switch { UsagePage => UsageWidth, RunningPage or DonePage => ListWidth, HistoryPage => HistoryWidth, _ => SettingsWidth };
     public const int MaxSettingRows = 11;
     private const int MaxRows = 5;
-    private const float SettingRowHeight = 28, SettingsTop = 4, SettingsBottom = 10, SwitchWidth = 34, SwitchHeight = 20, SegmentHeight = 22, SettingsInset = 20;
-    private const float TabHeight = 28, TabGap = 8, TabPad = 14, TabLeft = 18, TabTop = 8, MeterWidth = 92;
-    public static float MaxHeight => HeaderHeight + Math.Max(MaxRows * RowHeight + BottomPad, MaxSettingRows * SettingRowHeight + SettingsTop + SettingsBottom);
+    // Settings: rows of two columns under group headings. MaxSettingsHeight is what the canvas reserves; the layout asserts it fits.
+    private const float SettingRowHeight = 36, GroupHeaderHeight = 30, GroupGap = 10, SettingsTop = 10, SettingsBottom = 16, SettingsPad = 24, ColumnGap = 32;
+    private const float SwitchWidth = 38, SwitchHeight = 22, SegmentHeight = 24, MaxSettingsHeight = 330;
+    private const float TabHeight = 30, TabGap = 8, TabPad = 14, TabLeft = 20, TabTop = 9;
+    private const float ProviderHeight = 88, MeterX = 236, MeterGap = 28, RightPad = 28;
+    private float MeterWidth => (Width - RightPad - MeterX - MeterGap) / 2;
+    // History chart: plot box inside the page, and the number of columns the curve is reduced to.
+    private const float PlotLeft = 56, PlotTop = 58, PlotHeight = 136, ChipHeight = 24, ChipTop = 14, ChartColumns = 400;
+    public static float MaxHeight => HeaderHeight + Math.Max(Math.Max(MaxRows * RowHeight + BottomPad, MaxSettingsHeight), HistoryHeight);
 
     private ProviderUsage? _claude, _codex;
     private IReadOnlyList<AgentSession> _running = [];
     private IReadOnlyList<CompletedTurn> _recent = [];
     private RectangleF[]? _tabs;
+    private UsageHistory? _history;
+    private ChartCache? _chart;
 
     public int Page { get; set; }
     public int HoverTab { get; set; } = -1;
@@ -406,12 +418,42 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
     private SettingRow[] _settings = [];
     private float[] _knobs = [];
 
-    public void SetSettings(SettingRow[] rows) => _settings = rows;
+    // Settings layout, in surface coordinates: one rectangle per row and a heading per group.
+    private RectangleF[] _rowRects = [];
+    private (string Title, RectangleF Rect)[] _groupHeads = [];
+    private float _settingsHeight = 72;
+
+    public void SetSettings(SettingRow[] rows)
+    {
+        _settings = rows;
+        var colWidth = (SettingsWidth - 2 * SettingsPad - ColumnGap) / 2;
+        var y = new[] { HeaderHeight + SettingsTop, HeaderHeight + SettingsTop };
+        var rects = new RectangleF[rows.Length];
+        var heads = new List<(string, RectangleF)>();
+        // Each group goes under the shorter column, so the two stay about as tall as each other.
+        foreach (var group in rows.Select((row, index) => (row, index)).GroupBy(item => item.row.Group))
+        {
+            var column = y[0] <= y[1] ? 0 : 1;
+            var x = SettingsPad + column * (colWidth + ColumnGap);
+            heads.Add((group.Key, new RectangleF(x, y[column], colWidth, GroupHeaderHeight)));
+            y[column] += GroupHeaderHeight;
+            foreach (var (_, index) in group)
+            {
+                rects[index] = new RectangleF(x, y[column], colWidth, SettingRowHeight);
+                y[column] += SettingRowHeight;
+            }
+            y[column] += GroupGap;
+        }
+        _rowRects = rects;
+        _groupHeads = heads.ToArray();
+        _settingsHeight = rows.Length == 0 ? 72 : Math.Max(y[0], y[1]) - GroupGap + SettingsBottom - HeaderHeight;
+        System.Diagnostics.Debug.Assert(_settingsHeight <= MaxSettingsHeight, "settings page is taller than the canvas reserves");
+    }
 
     public RectangleF ActiveTabRect => Tabs[Math.Clamp(Page, 0, Tabs.Length - 1)];
 
     /// <summary>The gear in the header's right corner; it opens and closes the settings page.</summary>
-    public static readonly RectangleF GearRect = new(Width - 20 - 26, 9, 26, 26);
+    public RectangleF GearRect => new(Width - 24 - 28, 10, 28, 28);
     public bool HoverGear { get; set; }
     public float GearAngle { get; private set; }
     public bool GearAt(PointF point) => RectangleF.Inflate(GearRect, 3, 3).Contains(point);
@@ -427,23 +469,31 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         return changed;
     }
 
-    public float Height => HeaderHeight + Page switch { 0 => UsageHeight, RunningPage => ListHeight(_running.Count), DonePage => ListHeight(_recent.Count), _ => SettingsHeight() };
+    public float Height => HeaderHeight + Page switch
+    {
+        UsagePage => UsageHeight,
+        RunningPage => ListHeight(_running.Count),
+        DonePage => ListHeight(_recent.Count),
+        HistoryPage => HistoryHeight,
+        _ => _settingsHeight
+    };
 
     public override IReadOnlyList<(RectangleF Rect, AgentKind Kind, float RingGap)> LiveIcons => Page != RunningPage ? [] : _running.Take(MaxRows)
-        .Select((session, row) => (Rect: new RectangleF(20, HeaderHeight + row * RowHeight + 6, 26, 26), session))
+        .Select((session, row) => (Rect: new RectangleF(24, HeaderHeight + row * RowHeight + 8, 28, 28), session))
         .Where(item => !item.session.Waiting).Select(item => (item.Rect, item.session.Kind, 3.5f)).ToList();
     public override SizeF Size => new(Width, Height);
     public override float FixedTop => HeaderHeight;
-    public override float Radius => 30;
+    public override float Radius => 32;
 
-    private float SettingsHeight() => _settings.Length == 0 ? 64 : _settings.Length * SettingRowHeight + SettingsTop + SettingsBottom;
-    private static float ListHeight(int count) => count == 0 ? 64 : Math.Min(MaxRows, count) * RowHeight + BottomPad;
+    private static float ListHeight(int count) => count == 0 ? 72 : Math.Min(MaxRows, count) * RowHeight + BottomPad;
 
     public void SetUsage(ProviderUsage claude, ProviderUsage codex)
     {
         _claude = claude;
         _codex = codex;
     }
+
+    public void SetHistory(UsageHistory history) => _history = history;
 
     public void SetActivity(IReadOnlyList<AgentSession> running, IReadOnlyList<CompletedTurn> recent)
     {
@@ -452,7 +502,7 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         _recent = recent;
     }
 
-    private string[] Labels => ["Usage", _running.Count > 0 ? $"Running {_running.Count}" : "Running", "Done"];
+    private string[] Labels => ["Usage", _running.Count > 0 ? $"Running {_running.Count}" : "Running", "Done", "History"];
 
     private RectangleF[] Tabs
     {
@@ -486,10 +536,14 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         {
             DrawTabs(g, st);
             if (ShowClock) DrawClock(g, st, Tabs[^1].Right);
-            if (Page == 0) DrawUsage(g, st);
-            else if (Page == RunningPage) DrawRunning(g, st);
-            else if (Page == DonePage) DrawDone(g, st);
-            else DrawSettings(g, st);
+            switch (Page)
+            {
+                case UsagePage: DrawUsage(g, st); break;
+                case RunningPage: DrawRunning(g, st); break;
+                case DonePage: DrawDone(g, st); break;
+                case HistoryPage: DrawHistory(g, st); break;
+                default: DrawSettings(g, st); break;
+            }
         }
         return bitmap;
     }
@@ -502,20 +556,20 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         {
             if (i != HoverTab || i == Page) continue;
             using var hoverPath = IslandStyle.ContinuousRect(Tabs[i], TabHeight / 2, 0);
-            using var hoverFill = new SolidBrush(Color.FromArgb(20, 255, 255, 255));
+            using var hoverFill = new SolidBrush(IslandStyle.Alpha2);
             g.FillPath(hoverFill, hoverPath);
         }
         if (Page < SettingsPage)
         {
             using var path = IslandStyle.ContinuousRect(highlight, TabHeight / 2, 0);
-            using var fill = new SolidBrush(Color.FromArgb(40, 255, 255, 255));
+            using var fill = new SolidBrush(IslandStyle.Thumb);
             g.FillPath(fill, path);
         }
         DrawGear(g);
         for (var i = 0; i < Tabs.Length; i++)
         {
             var rect = Tabs[i];
-            IslandStyle.Text(g, labels[i], st.Body, i == Page ? IslandStyle.Primary : IslandStyle.Secondary, rect.X + TabPad, rect.Y + 18.5f);
+            IslandStyle.Text(g, labels[i], st.Body, i == Page ? IslandStyle.Primary : IslandStyle.Secondary, rect.X + TabPad, rect.Y + 19.5f);
         }
     }
 
@@ -525,12 +579,12 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         if (active || HoverGear)
         {
             using var back = IslandStyle.ContinuousRect(GearRect, GearRect.Height / 2, 0);
-            using var fill = new SolidBrush(Color.FromArgb(active ? 40 : 20, 255, 255, 255));
+            using var fill = new SolidBrush(active ? IslandStyle.Thumb : IslandStyle.Alpha2);
             g.FillPath(fill, back);
         }
         var (cx, cy) = (GearRect.X + GearRect.Width / 2, GearRect.Y + GearRect.Height / 2);
         const int teeth = 8;
-        const float outer = 8f, inner = 6.2f, hole = 2.6f;
+        const float outer = 8.6f, inner = 6.7f, hole = 2.8f;
         var points = new List<PointF>();
         var spin = GearAngle * (float)Math.PI / 180;
         for (var i = 0; i < teeth; i++)
@@ -548,13 +602,13 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         g.FillPath(ink, gear);
     }
 
-    private static void DrawClock(Graphics g, IslandStyle st, float tabsRight)
+    private void DrawClock(Graphics g, IslandStyle st, float tabsRight)
     {
         var now = DateTime.Now;
         var time = now.ToString("HH:mm");
         var date = now.ToString("ddd, MMM d", System.Globalization.CultureInfo.InvariantCulture);
-        var timeX = GearRect.X - 10 - st.MeasureWidth(time, st.Value);
-        IslandStyle.Text(g, time, st.Value, IslandStyle.Primary, timeX, 27);
+        var timeX = GearRect.X - 12 - st.MeasureWidth(time, st.Value);
+        IslandStyle.Text(g, time, st.Value, IslandStyle.Primary, timeX, 29);
         var dateX = timeX - 8 - st.MeasureWidth(date, st.Caption);
         if (dateX < tabsRight + 10) // the weekday goes first, then the whole date, when the tabs need the room
         {
@@ -562,23 +616,26 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
             dateX = timeX - 8 - st.MeasureWidth(date, st.Caption);
             if (dateX < tabsRight + 10) return;
         }
-        IslandStyle.Text(g, date, st.Caption, IslandStyle.Secondary, dateX, 26.5f);
+        IslandStyle.Text(g, date, st.Caption, IslandStyle.Secondary, dateX, 28.5f);
     }
 
     // ---- settings page ----
-
-    private float RowTop(int index) => HeaderHeight + SettingsTop + index * SettingRowHeight;
 
     /// <summary>Control rectangles of a row: one for a switch, one per option for a segmented control.</summary>
     private RectangleF[] Controls(int index)
     {
         var row = _settings[index];
-        var top = RowTop(index) + (SettingRowHeight - (row.Options.Length == 0 ? SwitchHeight : SegmentHeight)) / 2;
-        if (row.Options.Length == 0) return [new RectangleF(Width - SettingsInset - SwitchWidth, top, SwitchWidth, SwitchHeight)];
-        var widths = row.Options.Select(option => Math.Max(38, style.MeasureWidth(option, style.Caption) + 18)).ToArray();
-        var x = Width - SettingsInset - widths.Sum();
-        return widths.Select(w => { var rect = new RectangleF(x, top, w, SegmentHeight); x += w; return rect; }).ToArray();
+        var rect = _rowRects[index];
+        if (row.Options.Length == 0)
+            return [new RectangleF(rect.Right - SwitchWidth, rect.Y + (rect.Height - SwitchHeight) / 2, SwitchWidth, SwitchHeight)];
+        var widths = row.Options.Select(option => Math.Max(40, style.MeasureWidth(option, style.Caption) + 20)).ToArray();
+        var x = rect.Right - widths.Sum();
+        var top = rect.Y + (rect.Height - SegmentHeight) / 2;
+        return widths.Select(w => { var r = new RectangleF(x, top, w, SegmentHeight); x += w; return r; }).ToArray();
     }
+
+    /// <summary>The whole line answers the pointer, a little beyond the column so the hover fill has room around the text.</summary>
+    private RectangleF RowHit(int index) => RectangleF.Inflate(_rowRects[index], 8, 0);
 
     /// <summary>Row and new value under a point (a switch row answers anywhere on the line), or null.</summary>
     public (SettingRow Row, int Value)? SettingAt(PointF point)
@@ -587,7 +644,7 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         for (var i = 0; i < _settings.Length; i++)
         {
             var row = _settings[i];
-            if (point.Y < RowTop(i) || point.Y >= RowTop(i) + SettingRowHeight) continue;
+            if (!RowHit(i).Contains(point)) continue;
             if (row.Options.Length == 0) return (row, 1 - row.Selected);
             var controls = Controls(i);
             for (var option = 0; option < controls.Length; option++)
@@ -617,23 +674,31 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         }
         if (Page != SettingsPage) return -1;
         for (var i = 0; i < _settings.Length; i++)
-            if (point.Y >= RowTop(i) && point.Y < RowTop(i) + SettingRowHeight && point.X >= 10 && point.X < Width - 10) return i;
+            if (RowHit(i).Contains(point)) return i;
         return -1;
     }
 
     private void DrawSettings(Graphics g, IslandStyle st)
     {
+        foreach (var (title, rect) in _groupHeads)
+        {
+            IslandStyle.Text(g, title, st.Caption, IslandStyle.Tertiary, rect.X, rect.Y + 17);
+            using var rule = new Pen(IslandStyle.Alpha2, 1);
+            g.DrawLine(rule, rect.X, rect.Bottom - 5.5f, rect.Right, rect.Bottom - 5.5f);
+        }
         for (var i = 0; i < _settings.Length; i++)
         {
             var row = _settings[i];
+            var rect = _rowRects[i];
             if (i == HoverRow)
             {
-                using var path = IslandStyle.ContinuousRect(new RectangleF(10, RowTop(i), Width - 20, SettingRowHeight), 10, 0);
-                using var hover = new SolidBrush(Color.FromArgb(14, 255, 255, 255));
+                using var path = IslandStyle.ContinuousRect(RowHit(i), 10, 0);
+                using var hover = new SolidBrush(IslandStyle.Alpha1);
                 g.FillPath(hover, path);
             }
-            IslandStyle.Text(g, row.Label, st.Body, IslandStyle.Primary, SettingsInset, RowTop(i) + 18);
             var controls = Controls(i);
+            var labelWidth = controls[0].X - rect.X - 12;
+            IslandStyle.TextTrimmed(g, row.Label, st.Body, IslandStyle.Primary, rect.X, rect.Y + 22.5f, labelWidth);
             if (row.Options.Length == 0)
             {
                 var track = controls[0];
@@ -643,28 +708,33 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
                 using (var path = IslandStyle.ContinuousRect(track, SwitchHeight / 2, 0))
                 using (var fill = new SolidBrush(color))
                     g.FillPath(fill, path);
-                var knob = new RectangleF(track.X + 2 + on * (SwitchWidth - 4 - 16), track.Y + 2, 16, 16);
+                var knob = new RectangleF(track.X + 2 + on * (SwitchWidth - 4 - (SwitchHeight - 4)), track.Y + 2, SwitchHeight - 4, SwitchHeight - 4);
                 using var knobFill = new SolidBrush(Color.FromArgb(250, 250, 250));
                 g.FillEllipse(knobFill, knob);
                 continue;
             }
-            var span = RectangleF.Union(controls[0], controls[^1]);
-            using (var path = IslandStyle.ContinuousRect(span, SegmentHeight / 2, 0))
-            using (var well = new SolidBrush(Color.FromArgb(26, 255, 255, 255)))
-                g.FillPath(well, path);
-            for (var option = 0; option < controls.Length; option++)
+            DrawSegments(g, st, controls, row.Options, row.Selected, -1);
+        }
+    }
+
+    /// <summary>A row of options in one well; the selected one is lifted. <paramref name="hover"/> is the option under the pointer, or -1.</summary>
+    private static void DrawSegments(Graphics g, IslandStyle st, RectangleF[] controls, string[] options, int selected, int hover)
+    {
+        var span = RectangleF.Union(controls[0], controls[^1]);
+        using (var path = IslandStyle.ContinuousRect(span, span.Height / 2, 0))
+        using (var well = new SolidBrush(IslandStyle.Alpha2))
+            g.FillPath(well, path);
+        for (var option = 0; option < controls.Length; option++)
+        {
+            if (option == selected || option == hover)
             {
-                var selected = option == row.Selected;
-                if (selected)
-                {
-                    using var path = IslandStyle.ContinuousRect(RectangleF.Inflate(controls[option], -2, -2), (SegmentHeight - 4) / 2, 0);
-                    using var fill = new SolidBrush(Color.FromArgb(56, 255, 255, 255));
-                    g.FillPath(fill, path);
-                }
-                var label = row.Options[option];
-                var labelX = controls[option].X + (controls[option].Width - st.MeasureWidth(label, st.Caption)) / 2;
-                IslandStyle.Text(g, label, st.Caption, selected ? IslandStyle.Primary : IslandStyle.Secondary, labelX, controls[option].Y + 15);
+                using var path = IslandStyle.ContinuousRect(RectangleF.Inflate(controls[option], -2, -2), (controls[option].Height - 4) / 2, 0);
+                using var fill = new SolidBrush(option == selected ? IslandStyle.Thumb : IslandStyle.Alpha2);
+                g.FillPath(fill, path);
             }
+            var label = options[option];
+            var labelX = controls[option].X + (controls[option].Width - st.MeasureWidth(label, st.Caption)) / 2;
+            IslandStyle.Text(g, label, st.Caption, option == selected ? IslandStyle.Primary : IslandStyle.Secondary, labelX, controls[option].Y + controls[option].Height / 2 + 4);
         }
     }
 
@@ -672,35 +742,45 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
 
     private void DrawUsage(Graphics g, IslandStyle st)
     {
-        DrawProvider(g, st, HeaderHeight, AgentKind.Claude, _claude);
-        using (var divider = new Pen(Color.FromArgb(22, 255, 255, 255), 1))
-            g.DrawLine(divider, 62, HeaderHeight + 48.5f, Width - 18, HeaderHeight + 48.5f);
-        DrawProvider(g, st, HeaderHeight + 52, AgentKind.Codex, _codex);
+        DrawProvider(g, st, HeaderHeight + 4, AgentKind.Claude, _claude);
+        using (var divider = new Pen(IslandStyle.Alpha2, 1))
+            g.DrawLine(divider, 72, HeaderHeight + 4 + ProviderHeight + 0.5f, Width - 24, HeaderHeight + 4 + ProviderHeight + 0.5f);
+        DrawProvider(g, st, HeaderHeight + 4 + ProviderHeight, AgentKind.Codex, _codex);
     }
 
     private void DrawProvider(Graphics g, IslandStyle st, float y, AgentKind kind, ProviderUsage? usage)
     {
         DrawRing(g, y, usage);
-        g.DrawImage(st.Icon(kind), new RectangleF(21, y + 8, 28, 28));
-        IslandStyle.Text(g, Agent.Name(kind), st.Name, IslandStyle.Primary, 62, y + 19);
+        g.DrawImage(st.Icon(kind), new RectangleF(27, y + 18, 28, 28));
+        IslandStyle.Text(g, Agent.Name(kind), st.Name, IslandStyle.Primary, 72, y + 29);
         var (status, statusColor) = Status(usage);
-        IslandStyle.Text(g, status, st.Caption, statusColor, 62, y + 36);
+        IslandStyle.Text(g, status, st.Caption, statusColor, 72, y + 46);
         if (usage is { FiveHour: null, Weekly: null, Error: { } error })
         {
             using var brush = new SolidBrush(IslandStyle.Secondary);
             using var format = new StringFormat { Trimming = StringTrimming.EllipsisCharacter };
-            g.DrawString(error, st.Body, brush, new RectangleF(196, y + 8, Width - 18 - 196, 34), format);
+            g.DrawString(error, st.Body, brush, new RectangleF(MeterX, y + 14, Width - RightPad - MeterX, 40), format);
             return;
         }
-        Meter(g, st, 196, y, "5 hours", usage?.FiveHour, usage is not null);
-        Meter(g, st, 196 + MeterWidth + 22, y, "Week", usage?.Weekly, usage is not null);
+        Meter(g, st, MeterX, y, "5 hours", usage?.FiveHour, usage is not null);
+        Meter(g, st, MeterX + MeterWidth + MeterGap, y, "Week", usage?.Weekly, usage is not null);
+        DrawPace(g, st, y, usage);
+    }
+
+    /// <summary>The verdict in one sentence under the meters: a dot in the level's colour, then the words.</summary>
+    private void DrawPace(Graphics g, IslandStyle st, float y, ProviderUsage? usage)
+    {
+        if (UsagePace.Of(usage, DateTimeOffset.Now) is not { } pace) return;
+        var color = pace.Level switch { PaceLevel.Fine => IslandStyle.Success, PaceLevel.Heavy => IslandStyle.Amber, _ => IslandStyle.Warning };
+        using (var dot = new SolidBrush(color)) g.FillEllipse(dot, 72, y + 69, 8, 8);
+        IslandStyle.TextTrimmed(g, pace.Text, st.Body, IslandStyle.Primary, 88, y + 78, Width - RightPad - 88);
     }
 
     /// <summary>Ring around the logo showing the most-used window, coloured by level (Agent HUD's Simple mode).</summary>
     private void DrawRing(Graphics g, float y, ProviderUsage? usage)
     {
-        var ring = new RectangleF(16, y + 3, 38, 38);
-        using (var track = new Pen(Color.FromArgb(34, 255, 255, 255), 2.5f)) g.DrawEllipse(track, ring);
+        var ring = new RectangleF(22, y + 13, 38, 38);
+        using (var track = new Pen(IslandStyle.Alpha3, 2.5f)) g.DrawEllipse(track, ring);
         var used = Math.Max(usage?.FiveHour?.UsedPercent ?? 0, usage?.Weekly?.UsedPercent ?? 0);
         var sweep = (float)Math.Clamp(used / 100, 0, 1) * Math.Clamp(MeterProgress, 0, 1) * 360;
         if (sweep < 1) return;
@@ -719,14 +799,14 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
 
     private void Meter(Graphics g, IslandStyle st, float x, float y, string label, UsageWindow? window, bool loaded)
     {
-        IslandStyle.Text(g, label, st.Body, IslandStyle.Secondary, x, y + 18);
+        IslandStyle.Text(g, label, st.Body, IslandStyle.Secondary, x, y + 24);
         var percent = window is null ? "—" : $"{window.UsedPercent:0.#}%";
-        st.RightAligned(g, percent, st.Value, IslandStyle.Primary, x + MeterWidth, y + 19);
+        st.RightAligned(g, percent, st.Value, IslandStyle.Primary, x + MeterWidth, y + 25);
 
-        const float barHeight = 5;
-        var bar = new RectangleF(x, y + 25, MeterWidth, barHeight);
+        const float barHeight = 6;
+        var bar = new RectangleF(x, y + 32, MeterWidth, barHeight);
         using (var trackPath = IslandStyle.ContinuousRect(bar, barHeight / 2))
-        using (var track = new SolidBrush(Color.FromArgb(38, 255, 255, 255)))
+        using (var track = new SolidBrush(IslandStyle.Alpha3))
             g.FillPath(track, trackPath);
         if (window is { UsedPercent: > 0 })
         {
@@ -736,11 +816,178 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
             g.FillPath(fill, fillPath);
         }
         var reset = window?.ResetsAt is { } time ? ResetText(time.ToLocalTime()) : loaded ? "No data" : "";
-        IslandStyle.Text(g, reset, st.Caption, IslandStyle.Secondary, x, y + 44);
+        IslandStyle.Text(g, reset, st.Caption, IslandStyle.Secondary, x, y + 54);
     }
 
     private static string ResetText(DateTimeOffset time) =>
         time.Date == DateTime.Today ? $"Resets {time:HH:mm}" : $"Resets {time:M/d HH:mm}";
+
+    // ---- history page ----
+
+    /// <summary>False: the 5-hour windows over the last 24 hours. True: the weekly windows over the last 7 days.</summary>
+    public bool HistoryWeekly { get; set; }
+
+    /// <summary>Option of the range switch under the pointer, or -1.</summary>
+    public int HoverRange { get; set; } = -1;
+
+    private static readonly string[] RangeLabels = ["5 hours", "Week"];
+
+    private RectangleF[] RangeRects
+    {
+        get
+        {
+            var x = 24f;
+            return RangeLabels.Select(label =>
+            {
+                var rect = new RectangleF(x, HeaderHeight + ChipTop, style.MeasureWidth(label, style.Caption) + 24, ChipHeight);
+                x = rect.Right;
+                return rect;
+            }).ToArray();
+        }
+    }
+
+    /// <summary>Option of the range switch under a point, or -1.</summary>
+    public int RangeAt(PointF point)
+    {
+        if (Page != HistoryPage) return -1;
+        var rects = RangeRects;
+        for (var i = 0; i < rects.Length; i++)
+            if (rects[i].Contains(point)) return i;
+        return -1;
+    }
+
+    /// <summary>One provider's curve, already reduced to the plot: segments of points in 0..1 of the range, and the latest reading.</summary>
+    private sealed record ChartLine(AgentKind Kind, List<PointF[]> Segments, double? Latest);
+
+    private sealed record ChartCache(int Version, bool Weekly, long Minute, ChartLine[] Lines);
+
+    private ChartLine[] ChartLines(DateTimeOffset now)
+    {
+        var version = _history?.Version ?? 0;
+        if (_chart is { } cached && cached.Version == version && cached.Weekly == HistoryWeekly && cached.Minute == now.ToUnixTimeSeconds() / 60) return cached.Lines;
+        var range = HistoryWeekly ? TimeSpan.FromDays(7) : TimeSpan.FromHours(24);
+        var since = now - range;
+        var gap = range.TotalSeconds / 48; // a hole longer than this (the PC slept, the app was closed) is not drawn across
+        ChartLine Build(AgentKind kind)
+        {
+            var points = _history?.Points(kind, HistoryWeekly, since) ?? [];
+            var segments = new List<PointF[]>();
+            var current = new List<PointF>();
+            long previousAt = 0, previousColumn = -1;
+            foreach (var (at, value) in points)
+            {
+                if (current.Count > 0 && at - previousAt > gap)
+                {
+                    segments.Add(current.ToArray());
+                    current.Clear();
+                    previousColumn = -1;
+                }
+                var x = (float)((at - since.ToUnixTimeSeconds()) / range.TotalSeconds);
+                var point = new PointF(Math.Clamp(x, 0, 1), (float)Math.Clamp(value / 100, 0, 1));
+                var column = (long)(point.X * ChartColumns);
+                if (column == previousColumn) current[^1] = point; // one point per column: the latest in it
+                else current.Add(point);
+                (previousAt, previousColumn) = (at, column);
+            }
+            if (current.Count > 0) segments.Add(current.ToArray());
+            return new ChartLine(kind, segments, points.Count > 0 ? points[^1].Value : null);
+        }
+        var lines = new[] { Build(AgentKind.Claude), Build(AgentKind.Codex) };
+        _chart = new ChartCache(version, HistoryWeekly, now.ToUnixTimeSeconds() / 60, lines);
+        return lines;
+    }
+
+    private void DrawHistory(Graphics g, IslandStyle st)
+    {
+        var now = DateTimeOffset.Now;
+        var lines = ChartLines(now);
+        var chips = RangeRects;
+        DrawSegments(g, st, chips, RangeLabels, HistoryWeekly ? 1 : 0, HoverRange);
+        IslandStyle.Text(g, HistoryWeekly ? "Last 7 days" : "Last 24 hours", st.Caption, IslandStyle.Tertiary, chips[^1].Right + 14, chips[0].Y + 16);
+
+        // Legend with the latest reading, right-aligned in the top row.
+        var right = Width - RightPad;
+        for (var i = lines.Length - 1; i >= 0; i--)
+        {
+            var text = $"{Agent.Name(lines[i].Kind)}  {(lines[i].Latest is { } latest ? $"{latest:0.#}%" : "—")}";
+            var x = right - st.MeasureWidth(text, st.Body);
+            IslandStyle.Text(g, text, st.Body, IslandStyle.Primary, x, chips[0].Y + 16);
+            using (var dot = new SolidBrush(Agent.Accent(lines[i].Kind))) g.FillEllipse(dot, x - 14, chips[0].Y + 8, 7, 7);
+            right = x - 14 - 20;
+        }
+
+        var plot = new RectangleF(PlotLeft, HeaderHeight + PlotTop, Width - RightPad - PlotLeft, PlotHeight);
+        DrawChartGrid(g, st, plot, now);
+        if (lines.All(line => line.Segments.All(segment => segment.Length < 2)))
+        {
+            const string empty = "Collecting history. The curve appears after a few readings.";
+            // Between the 50 % and 80 % guides, so the words sit in clear space.
+            IslandStyle.Text(g, empty, st.Body, IslandStyle.Secondary, plot.X + (plot.Width - st.MeasureWidth(empty, st.Body)) / 2, plot.Bottom - plot.Height * 0.65f + 4);
+            return;
+        }
+
+        // The curves draw in from the left as the fill progress rises.
+        var reveal = Math.Clamp(MeterProgress, 0, 1);
+        g.SetClip(new RectangleF(plot.X - 3, plot.Y - 6, plot.Width * reveal + 6, plot.Height + 12));
+        foreach (var line in lines)
+        {
+            var color = Agent.Accent(line.Kind);
+            using var pen = new Pen(color, 2f) { LineJoin = LineJoin.Round, StartCap = LineCap.Round, EndCap = LineCap.Round };
+            using var area = new SolidBrush(Color.FromArgb(34, color));
+            using var solid = new SolidBrush(color);
+            foreach (var segment in line.Segments)
+            {
+                var path = segment.Select(p => new PointF(plot.X + p.X * plot.Width, plot.Bottom - p.Y * plot.Height)).ToArray();
+                if (path.Length == 1)
+                {
+                    g.FillEllipse(solid, path[0].X - 2, path[0].Y - 2, 4, 4);
+                    continue;
+                }
+                g.FillPolygon(area, path.Append(new PointF(path[^1].X, plot.Bottom)).Append(new PointF(path[0].X, plot.Bottom)).ToArray());
+                g.DrawLines(pen, path);
+            }
+            if (line.Segments.Count > 0 && line.Segments[^1] is { Length: > 0 } last && reveal >= 0.999f)
+            {
+                var tip = last[^1];
+                g.FillEllipse(solid, plot.X + tip.X * plot.Width - 3.5f, plot.Bottom - tip.Y * plot.Height - 3.5f, 7, 7);
+            }
+        }
+        g.ResetClip();
+    }
+
+    /// <summary>Horizontal guides at 0, 50 and 100 %, the 80 % warning level, and the time ticks under the plot.</summary>
+    private void DrawChartGrid(Graphics g, IslandStyle st, RectangleF plot, DateTimeOffset now)
+    {
+        using (var guide = new Pen(IslandStyle.Alpha2, 1))
+            foreach (var percent in new[] { 0, 50, 100 })
+            {
+                var y = (float)Math.Round(plot.Bottom - plot.Height * percent / 100) + 0.5f;
+                g.DrawLine(guide, plot.X, y, plot.Right, y);
+                var label = percent.ToString();
+                IslandStyle.Text(g, label, st.Caption, IslandStyle.Tertiary, plot.X - 8 - st.MeasureWidth(label, st.Caption), y + 4);
+            }
+        using (var warn = new Pen(Color.FromArgb(70, IslandStyle.Amber), 1) { DashStyle = DashStyle.Dash })
+        {
+            var y = (float)Math.Round(plot.Bottom - plot.Height * 0.8) + 0.5f;
+            g.DrawLine(warn, plot.X, y, plot.Right, y);
+        }
+
+        var range = HistoryWeekly ? TimeSpan.FromDays(7) : TimeSpan.FromHours(24);
+        var local = (now - range).LocalDateTime;
+        var step = HistoryWeekly ? TimeSpan.FromDays(1) : TimeSpan.FromHours(6);
+        var tick = HistoryWeekly ? local.Date.AddDays(1) : local.Date.AddHours(Math.Ceiling(local.TimeOfDay.TotalHours / 6) * 6);
+        using var tickPen = new Pen(IslandStyle.Alpha1, 1);
+        for (; tick <= now.LocalDateTime; tick += step)
+        {
+            var x = (float)(plot.X + (tick - local).TotalSeconds / range.TotalSeconds * plot.Width);
+            g.DrawLine(tickPen, (float)Math.Round(x) + 0.5f, plot.Y, (float)Math.Round(x) + 0.5f, plot.Bottom);
+            var label = HistoryWeekly ? tick.ToString("ddd", System.Globalization.CultureInfo.InvariantCulture) : tick.ToString("HH:mm");
+            var labelWidth = st.MeasureWidth(label, st.Caption);
+            var labelX = x - labelWidth / 2;
+            if (labelX >= plot.X - 4 && labelX + labelWidth <= Width - 12)
+                IslandStyle.Text(g, label, st.Caption, IslandStyle.Tertiary, labelX, plot.Bottom + 19);
+        }
+    }
 
     // ---- activity page ----
 
@@ -777,20 +1024,20 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
         }
     }
 
-    private static void Empty(Graphics g, IslandStyle st, string text) =>
-        IslandStyle.Text(g, text, st.Body, IslandStyle.Secondary, (Width - st.MeasureWidth(text, st.Body)) / 2, HeaderHeight + 26);
+    private void Empty(Graphics g, IslandStyle st, string text) =>
+        IslandStyle.Text(g, text, st.Body, IslandStyle.Secondary, (Width - st.MeasureWidth(text, st.Body)) / 2, HeaderHeight + 32);
 
     private void HoverBack(Graphics g, float y, int index)
     {
         if (Page is not (RunningPage or DonePage) || index != HoverRow) return;
-        using var path = IslandStyle.ContinuousRect(new RectangleF(10, y, Width - 20, RowHeight - 4), 12, 0);
-        using var fill = new SolidBrush(Color.FromArgb(14, 255, 255, 255));
+        using var path = IslandStyle.ContinuousRect(new RectangleF(12, y, Width - 24, RowHeight - 4), 14, 0);
+        using var fill = new SolidBrush(IslandStyle.Alpha1);
         g.FillPath(fill, path);
     }
 
-    private static void Row(Graphics g, IslandStyle st, float y, AgentKind kind, string project, bool running, string primary, string secondary, bool waiting = false)
+    private void Row(Graphics g, IslandStyle st, float y, AgentKind kind, string project, bool running, string primary, string secondary, bool waiting = false)
     {
-        var icon = new RectangleF(20, y + 6, 26, 26);
+        var icon = new RectangleF(24, y + 8, 28, 28);
         if (!running || waiting) g.DrawImage(st.Icon(kind), icon); // a working session's logo is drawn live by the island
         if (!running || waiting)
         {
@@ -798,9 +1045,9 @@ internal sealed class PanelSurface(IslandStyle style) : IslandSurface
             using (var ring = new SolidBrush(Color.Black)) g.FillEllipse(ring, RectangleF.Inflate(badge, 1.5f, 1.5f));
             using (var dot = new SolidBrush(waiting ? NoticeLook.Question : IslandStyle.Success)) g.FillEllipse(dot, badge);
         }
-        IslandStyle.TextTrimmed(g, Agent.Name(kind), st.Name, IslandStyle.Primary, 58, y + 19, 150);
-        IslandStyle.TextTrimmed(g, project, st.Caption, IslandStyle.Secondary, 58, y + 35, 150);
-        st.RightAligned(g, primary, st.Name, running ? IslandStyle.Primary : IslandStyle.Success, Width - 20, y + 19);
-        st.RightAligned(g, secondary, st.Caption, waiting ? NoticeLook.Question : IslandStyle.Secondary, Width - 20, y + 35);
+        IslandStyle.TextTrimmed(g, Agent.Name(kind), st.Name, IslandStyle.Primary, 68, y + 22, 280);
+        IslandStyle.TextTrimmed(g, project, st.Caption, IslandStyle.Secondary, 68, y + 39, 280);
+        st.RightAligned(g, primary, st.Name, running ? IslandStyle.Primary : IslandStyle.Success, Width - 24, y + 22);
+        st.RightAligned(g, secondary, st.Caption, waiting ? NoticeLook.Question : IslandStyle.Secondary, Width - 24, y + 39);
     }
 }

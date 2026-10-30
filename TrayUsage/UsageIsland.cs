@@ -22,16 +22,17 @@ internal enum IslandTheme { Classic, Pill }
 /// </summary>
 internal sealed class UsageIsland : IDisposable
 {
-    private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f, ContentDrop = 2;
-    private const double GrowDelay = 0.03, ShrinkDelay = 0.05;
+    private const float TopGap = 8, Shoulder = 9, PillWidth = 120, PillHeight = 32, MaxOvershoot = 1.05f;
     private readonly IslandStyle _style = new();
     private readonly PanelSurface _panel;
     private readonly Stopwatch _clock = new();
     private readonly bool _animate = ShouldAnimate();
-    private readonly Spring _w = new(PillWidth), _h = new(PillHeight), _r = new(PillHeight / 2), _top = new(0);
-    private readonly Spring _contentAlpha = new(0), _ghostAlpha = new(0), _presence = new(0), _lift = new(0);
-    private readonly Spring _tabX = new(0), _tabW = new(0), _meter = new(1), _gear = new(0);
-    private readonly Spring[] _knobs = Enumerable.Range(0, PanelSurface.MaxSettingRows).Select(_ => new Spring(0)).ToArray();
+    // Every spring the island owns is listed in _all (shape, content, panel) or _knobs (one per switch); _every is both. The frame
+    // loop advances, snaps and tests rest on _every, so a spring added to either list is looked after everywhere.
+    private readonly Spring _w = Spring.Pixels(PillWidth), _h = Spring.Pixels(PillHeight), _r = Spring.Pixels(PillHeight / 2), _top = Spring.Pixels(0);
+    private readonly Spring _contentAlpha = Spring.Unit(0), _ghostAlpha = Spring.Unit(0), _presence = Spring.Unit(0), _lift = Spring.Pixels(0);
+    private readonly Spring _tabX = Spring.Pixels(0), _tabW = Spring.Pixels(0), _meter = Spring.Unit(1), _gear = Spring.Pixels(0);
+    private readonly Spring[] _knobs = Enumerable.Range(0, PanelSurface.MaxSettingRows).Select(_ => Spring.Unit(0)).ToArray();
     private readonly float[] _knobValues = new float[PanelSurface.MaxSettingRows];
     private int _clockMinute = -1, _returnPage;
     private bool _pageSwitch, _ghostScales = true;
@@ -39,7 +40,7 @@ internal sealed class UsageIsland : IDisposable
     private Color _glowColor = Color.Black;
     private float _glowRest;
     private bool _glowDouble;
-    private readonly Spring[] _all;
+    private readonly Spring[] _all, _every;
     private SynchronizationContext? _ui;
     private object? _pacer;
     private int _framePending;
@@ -61,6 +62,7 @@ internal sealed class UsageIsland : IDisposable
     {
         _panel = new PanelSurface(_style);
         _all = [_w, _h, _r, _top, _contentAlpha, _ghostAlpha, _presence, _lift, _tabX, _tabW, _meter, _gear];
+        _every = [.. _all, .. _knobs];
     }
 
     private bool HasLiveIcons => _shown && _surface is { LiveIcons.Count: > 0 };
@@ -124,7 +126,7 @@ internal sealed class UsageIsland : IDisposable
     public bool ShowingDetail => _shown && _surface is DetailSurface;
 
     private bool WantsHand => _shown && (_surface is NoticeSurface or DetailSurface ||
-        _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverRow >= 0));
+        _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverRow >= 0 || p.HoverRange >= 0));
 
     public IslandMode Mode => _surface is PanelSurface ? IslandMode.Panel : IslandMode.Notice;
     public bool PanelActive => Visible && _shown && _surface is PanelSurface;
@@ -133,6 +135,8 @@ internal sealed class UsageIsland : IDisposable
     public Rectangle? ScreenBody => Visible && _shown && !_bodyPx.IsEmpty
         ? Rectangle.Round(new RectangleF(_origin.X + _bodyPx.X, _origin.Y + _bodyPx.Y, _bodyPx.Width, _bodyPx.Height))
         : null;
+
+    public void SetHistory(UsageHistory history) => _panel.SetHistory(history);
 
     public void SetUsage(ProviderUsage claude, ProviderUsage codex)
     {
@@ -176,7 +180,7 @@ internal sealed class UsageIsland : IDisposable
         var snap = !Visible || !_animate;
         for (var i = 0; i < _knobs.Length; i++)
         {
-            _knobs[i].Aim(i < rows.Length && rows[i].Options.Length == 0 ? rows[i].Selected : 0, Motion.Tab);
+            _knobs[i].To(i < rows.Length && rows[i].Options.Length == 0 ? rows[i].Selected : 0, Motion.Slide);
             if (snap) _knobs[i].Snap();
         }
         for (var i = 0; i < _knobs.Length; i++) _knobValues[i] = (float)_knobs[i].Value;
@@ -226,7 +230,7 @@ internal sealed class UsageIsland : IDisposable
     {
         var target = over && _shown && _surface is NoticeSurface ? 1 : 0;
         if (target == _lift.Target || !Visible) return;
-        _lift.Retarget(target, Motion.Top, Motion.Top);
+        _lift.To(target, Motion.Rise);
         if (!_animate) _lift.Snap();
         StartFrames();
     }
@@ -235,17 +239,17 @@ internal sealed class UsageIsland : IDisposable
     {
         if (!Visible || !_shown) return;
         _shown = false;
-        _w.Retarget(PillWidth, Motion.Smooth, Motion.Smooth); // closing is the smooth spring: no bounce on the way in
-        _h.Retarget(PillHeight, Motion.Smooth, Motion.Smooth);
-        _r.Retarget(PillHeight / 2, Motion.Smooth, Motion.Smooth);
+        _w.To(PillWidth, Motion.Close); // closing is the smooth spring: no bounce on the way in
+        _h.To(PillHeight, Motion.Close);
+        _r.To(PillHeight / 2, Motion.Close);
         _glowTime = -1; // a pulse in flight would outlive the body as a halo
         // Closing, the card gathers into the pill as it rises into the screen edge: the content shrinks with the body and
         // fades slowly, and the island is gone once it has cleared the edge (see Step).
-        _top.Retarget(RetractTop, Motion.Smooth, Motion.Smooth);
+        _top.To(RetractTop, Motion.Close);
         _pageSwitch = false;
         _glowRest = 0;
-        if (!(_animate && ToGhost(Motion.Fade))) _contentAlpha.Retarget(0, Motion.Fade, Motion.Fade);
-        _lift.Retarget(0, Motion.Top, Motion.Top);
+        if (!(_animate && ToGhost())) _contentAlpha.To(0, Motion.Fade);
+        _lift.To(0, Motion.Rise);
         _contentArm = 0;
         _meterArmed = false;
         SetInteractive(false);
@@ -284,7 +288,7 @@ internal sealed class UsageIsland : IDisposable
             crossfade = false;
             _window.ShowTopmost();
         }
-        else if (crossfade && ToGhost(Motion.Fade))
+        else if (crossfade && ToGhost())
         {
             // The old content fades and shrinks away while the new one fades in. Between two pages of the same panel
             // it only fades in place, and the header stays put: scaled or shifted text would shimmer.
@@ -304,27 +308,17 @@ internal sealed class UsageIsland : IDisposable
         _shown = true;
         UpdateSpin();
         SetGlow(surface, pulse: previous != surface && surface is NoticeSurface);
-        var pageSwitch = wasVisible && crossfade && previous == surface;
-        var morph = pageSwitch ? Motion.Page : wasVisible ? Motion.Snappy : Motion.Bouncy; // opening bounces, morphing between surfaces is snappy
-        if (pageSwitch)
-        {
-            // SwiftUI's conversion spring has no shrink floor, so a page switch overshoots on the way in as well
-            _w.Aim(size.Width, morph);
-            _h.Aim(size.Height, morph);
-            _r.Aim(surface.Radius, morph);
-        }
-        else
-        {
-            _w.Retarget(size.Width, morph, morph);
-            _h.Retarget(size.Height, morph, morph);
-            _r.Retarget(surface.Radius, morph, morph);
-        }
-        _top.Retarget(RestTop, Motion.Top, Motion.Top);
-        _presence.Retarget(1, Motion.Fade, Motion.Fade);
+        // opening bounces, morphing between surfaces is snappy, another page of the same surface swings past on the way in as well
+        var morph = !wasVisible ? Motion.Open : crossfade && previous == surface ? Motion.Page : Motion.Morph;
+        _w.To(size.Width, morph);
+        _h.To(size.Height, morph);
+        _r.To(surface.Radius, morph);
+        _top.To(RestTop, Motion.Rise);
+        _presence.To(1, Motion.Fade);
         if (_contentAlpha.Value < 1 || crossfade)
         {
-            _contentAlpha.Retarget(0, Motion.Fade, Motion.Fade);
-            _contentArm = growing ? GrowDelay : ShrinkDelay;
+            _contentAlpha.To(0, Motion.Fade);
+            _contentArm = growing ? Motion.GrowDelay : Motion.ShrinkDelay;
         }
         SetInteractive(true); // a notice answers a click, so its body takes the mouse (the rest of the window stays transparent)
         if (surface is PanelSurface panel)
@@ -332,11 +326,10 @@ internal sealed class UsageIsland : IDisposable
             var opening = !wasVisible || _panelPage != panel.Page;
             AimTab(snap: !wasVisible);
             _panelPage = panel.Page;
-            // The usage meters fill in after the shape has settled enough to read them.
-            if (opening && panel.Page == 0 && _animate)
+            // The usage meters and the history curves fill in after the shape has settled enough to read them.
+            if (opening && panel.Page is PanelSurface.UsagePage or PanelSurface.HistoryPage && _animate)
             {
                 _meter.Jump(0);
-                _meter.Aim(0, Motion.Meter);
                 _meterArmed = true;
             }
         }
@@ -352,8 +345,6 @@ internal sealed class UsageIsland : IDisposable
         }
         StartFrames();
     }
-
-    private const double GlowSeconds = 1.8;
 
     /// <summary>
     /// Colour glow around the body: a steady tint while something needs attention, plus a 1.8 s pulse when a notice
@@ -391,7 +382,7 @@ internal sealed class UsageIsland : IDisposable
         var pulse = 0.0;
         if (_glowTime >= 0)
         {
-            var phase = _glowTime / GlowSeconds * Math.PI * (_glowDouble ? 2 : 1);
+            var phase = _glowTime / Motion.GlowSeconds * Math.PI * (_glowDouble ? 2 : 1);
             pulse = Math.Pow(Math.Sin(phase), 2) * 0.9;
         }
         return (float)(_glowRest + pulse);
@@ -402,10 +393,10 @@ internal sealed class UsageIsland : IDisposable
         if (_panel.Page < PanelSurface.SettingsPage)
         {
             var tab = _panel.ActiveTabRect;
-            _tabX.Aim(tab.X, Motion.Tab);
-            _tabW.Aim(tab.Width, Motion.Tab);
+            _tabX.To(tab.X, Motion.Slide);
+            _tabW.To(tab.Width, Motion.Slide);
         }
-        _gear.Aim(_panel.Page == PanelSurface.SettingsPage ? 90 : 0, Motion.Tab);
+        _gear.To(_panel.Page == PanelSurface.SettingsPage ? 90 : 0, Motion.Slide);
         if (snap || !_animate)
         {
             _tabX.Snap();
@@ -416,7 +407,7 @@ internal sealed class UsageIsland : IDisposable
     }
 
     /// <summary>Hands the current content to the outgoing layer, which shrinks with the body and fades.</summary>
-    private bool ToGhost(Tuning fade)
+    private bool ToGhost()
     {
         if (_contentBitmap is null || _surface is null || _contentAlpha.Value <= 0.02) return false;
         _ghostBitmap?.Dispose();
@@ -425,7 +416,7 @@ internal sealed class UsageIsland : IDisposable
         _ghostSize = _surface.Size;
         _ghostScales = true;
         _ghostAlpha.Jump(_contentAlpha.Value);
-        _ghostAlpha.Retarget(0, fade, fade);
+        _ghostAlpha.To(0, Motion.Fade);
         _contentAlpha.Jump(0);
         return true;
     }
@@ -467,21 +458,19 @@ internal sealed class UsageIsland : IDisposable
     private void Step()
     {
         var now = _clock.Elapsed.TotalSeconds;
-        var elapsed = Math.Min(now - _lastTick, 0.05);
+        var elapsed = Math.Min(now - _lastTick, Motion.MaxFrame);
         _lastTick = now;
-        // 2 ms substeps keep the stiff radius spring (1200) stable.
-        for (var remaining = elapsed; remaining > 0; remaining -= 0.002)
+        for (var remaining = elapsed; remaining > 0; remaining -= Motion.Substep)
         {
-            var dt = Math.Min(0.002, remaining);
-            foreach (var spring in _all) spring.Advance(dt);
-            foreach (var spring in _knobs) spring.Advance(dt);
+            var dt = Math.Min(Motion.Substep, remaining);
+            foreach (var spring in _every) spring.Advance(dt);
         }
-        if (_glowTime >= 0 && (_glowTime += elapsed) >= GlowSeconds) _glowTime = -1;
+        if (_glowTime >= 0 && (_glowTime += elapsed) >= Motion.GlowSeconds) _glowTime = -1;
         if (_pageSwitch && _contentAlpha.Value >= 0.999 && _contentArm <= 0) _pageSwitch = false;
         if (_contentArm > 0 && (_contentArm -= elapsed) <= 0)
         {
-            _contentAlpha.Retarget(1, Motion.Fade, Motion.Fade);
-            if (_meterArmed) _meter.Aim(1, Motion.Meter);
+            _contentAlpha.To(1, Motion.Fade);
+            if (_meterArmed) _meter.To(1, Motion.Fill);
             _meterArmed = false;
         }
         // Closing: the body (and its shadow) has risen fully above the screen edge.
@@ -491,18 +480,11 @@ internal sealed class UsageIsland : IDisposable
             HideNow();
             return;
         }
-        var springsSettled = _contentArm <= 0 &&
-            !_meterArmed && _glowTime < 0 &&
-            new[] { _w, _h, _r, _top, _lift, _tabX, _tabW, _gear }.All(s => s.Settled(0.02, 0.2)) &&
-            new[] { _contentAlpha, _ghostAlpha, _presence, _meter }.All(s => s.Settled(0.002, 0.02)) &&
-            _knobs.All(s => s.Settled(0.002, 0.02));
+        var springsSettled = _contentArm <= 0 && !_meterArmed && _glowTime < 0 && _every.All(s => s.IsSettled);
         var live = HasLiveIcons;
         var settled = springsSettled && !live;
         if (springsSettled)
-        {
-            foreach (var spring in _all) spring.Snap();
-            foreach (var spring in _knobs) spring.Snap();
-        }
+            foreach (var spring in _every) spring.Snap();
         for (var i = 0; i < _knobs.Length; i++) _knobValues[i] = (float)_knobs[i].Value;
         if (_surface is PanelSurface animated && animated.SetAnimation((float)_tabX.Value, (float)_tabW.Value, (float)_meter.Value, _knobValues, (float)_gear.Value))
         {
@@ -544,7 +526,7 @@ internal sealed class UsageIsland : IDisposable
         }
     }
 
-    private Size CanvasSize => new((int)Math.Ceiling((PanelSurface.Width * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
+    private Size CanvasSize => new((int)Math.Ceiling((PanelSurface.MaxWidth * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
         (int)Math.Ceiling((TopGap + PanelSurface.MaxHeight * MaxOvershoot + Shadow.Margin) * _scale));
 
     private void Draw(Graphics g)
@@ -563,11 +545,11 @@ internal sealed class UsageIsland : IDisposable
 
         var s = _scale;
         var lift = (float)Math.Clamp(_lift.Value, 0, 1.2);
-        var width = ((float)_w.Value + 6 * lift) * s;
-        var height = ((float)_h.Value + 6 * lift) * s;
-        var top = ((float)_top.Value - (Docked ? 0 : 2 * lift)) * s; // hanging islands stay on the edge
+        var width = ((float)_w.Value + Motion.LiftSize * lift) * s;
+        var height = ((float)_h.Value + Motion.LiftSize * lift) * s;
+        var top = ((float)_top.Value - (Docked ? 0 : Motion.LiftTop * lift)) * s; // hanging islands stay on the edge
         var body = new RectangleF((CanvasSize.Width - width) / 2, top, width, height);
-        var radius = Math.Clamp(((float)_r.Value + 3 * lift) * s, 0, Math.Min(width, height) / 2);
+        var radius = Math.Clamp(((float)_r.Value + Motion.LiftRadius * lift) * s, 0, Math.Min(width, height) / 2);
         _bodyPx = body;
         var shoulder = Docked ? Shoulder * s : 0;
 
@@ -625,7 +607,7 @@ internal sealed class UsageIsland : IDisposable
         else if (_ghostBitmap is not null && _ghostAlpha.Value > 0.004)
         {
             // Outgoing content never enlarges: it scales with the smaller of the width and height ratios.
-            var scale = _ghostScales ? Math.Clamp(Math.Min(body.Width / (_ghostSize.Width * s), body.Height / (_ghostSize.Height * s)), 0.6f, 1f) : 1f;
+            var scale = _ghostScales ? Math.Clamp(Math.Min(body.Width / (_ghostSize.Width * s), body.Height / (_ghostSize.Height * s)), Motion.GhostMinScale, 1f) : 1f;
             var (gw, gh) = (_ghostBitmap.Width * scale, _ghostBitmap.Height * scale);
             var pivotY = body.Top + Math.Min(body.Height, _ghostBitmap.Height) / 2;
             DrawBlurFaded(g, _ghostBitmap, _ghostBlur, new RectangleF(body.X + body.Width / 2 - gw / 2, pivotY - gh / 2, gw, gh), _ghostAlpha.Value, _ghostAlpha.Value);
@@ -636,7 +618,7 @@ internal sealed class UsageIsland : IDisposable
         {
             var bitmap = _contentBitmap ??= _surface.Render(_style, s);
             // Whole pixels only: ClearType text resampled at a fractional offset shimmers while it moves.
-            var drop = pageSwitch ? 0 : (float)Math.Round(ContentDrop * s * (1 - alpha));
+            var drop = pageSwitch ? 0 : (float)Math.Round(Motion.ContentDrop * s * (1 - alpha));
             var origin = new PointF((float)Math.Round(body.X + body.Width / 2 - bitmap.Width / 2f), (float)Math.Round(body.Top + drop));
             _contentOrigin = origin;
             if (pageSwitch)
@@ -657,8 +639,8 @@ internal sealed class UsageIsland : IDisposable
             }
             else
             {
-                // Content enters the way the Dynamic Island's does: blurred, squeezed to 0.6 of its height from the top, fading in.
-                DrawBlurFaded(g, bitmap, _contentBlur, new RectangleF(origin.X, origin.Y, bitmap.Width, bitmap.Height * (0.6f + 0.4f * (float)alpha)), alpha, alpha);
+                // Content enters the way the Dynamic Island's does: blurred, squeezed to EnterSqueeze of its height from the top, fading in.
+                DrawBlurFaded(g, bitmap, _contentBlur, new RectangleF(origin.X, origin.Y, bitmap.Width, bitmap.Height * (Motion.EnterSqueeze + (1 - Motion.EnterSqueeze) * (float)alpha)), alpha, alpha);
             }
         }
         if (_surface is { LiveIcons.Count: > 0 } && alpha > 0.004) DrawLiveIcons(g, alpha);
@@ -690,10 +672,11 @@ internal sealed class UsageIsland : IDisposable
         g.Restore(saved);
     }
 
-    /// <summary>A ring with an arc that circles once every 1.1 s and stretches and shrinks as it goes.</summary>
+    /// <summary>A ring with an arc that circles once every <see cref="Motion.SweepSeconds"/> and stretches and shrinks as it goes.</summary>
     private static void DrawSweep(Graphics g, float cx, float cy, float radius, float scale, Color accent, int alpha)
     {
-        var turn = Environment.TickCount64 % 1100 / 1100.0;
+        const long period = (long)(Motion.SweepSeconds * 1000);
+        var turn = Environment.TickCount64 % period / (double)period;
         var length = 70 + 80 * (0.5 - 0.5 * Math.Cos(turn * 2 * Math.PI)); // 70..150 degrees
         var ring = new RectangleF(cx - radius, cy - radius, 2 * radius, 2 * radius);
         using var track = new Pen(Color.FromArgb(alpha * 40 / 255, 255, 255, 255), 2f * scale);
@@ -823,20 +806,23 @@ internal sealed class UsageIsland : IDisposable
                 var hover = panel.TabAt(point);
                 var hoverRow = panel.SettingRowAt(point);
                 var hoverGear = panel.GearAt(point);
-                if (hover != panel.HoverTab || hoverRow != panel.HoverRow || hoverGear != panel.HoverGear)
+                var hoverRange = panel.RangeAt(point);
+                if (hover != panel.HoverTab || hoverRow != panel.HoverRow || hoverGear != panel.HoverGear || hoverRange != panel.HoverRange)
                 {
                     panel.HoverTab = hover;
                     panel.HoverRow = hoverRow;
                     panel.HoverGear = hoverGear;
+                    panel.HoverRange = hoverRange;
                     Refresh();
                 }
                 break;
             case 0x02A3: // WM_MOUSELEAVE
-                if (panel.HoverTab != -1 || panel.HoverRow != -1 || panel.HoverGear)
+                if (panel.HoverTab != -1 || panel.HoverRow != -1 || panel.HoverGear || panel.HoverRange != -1)
                 {
                     panel.HoverTab = -1;
                     panel.HoverRow = -1;
                     panel.HoverGear = false;
+                    panel.HoverRange = -1;
                     Refresh();
                 }
                 break;
@@ -848,6 +834,7 @@ internal sealed class UsageIsland : IDisposable
                 }
                 else if (panel.GearAt(point)) SetPage(panel.Page == PanelSurface.SettingsPage ? _returnPage : PanelSurface.SettingsPage);
                 else if (panel.TabAt(point) is >= 0 and var tab) SetPage(tab);
+                else if (panel.RangeAt(point) is >= 0 and var range) SetHistoryRange(panel, range == 1);
                 else if (panel.SettingAt(point) is { } change)
                 {
                     Interacted?.Invoke();
@@ -873,6 +860,21 @@ internal sealed class UsageIsland : IDisposable
         Display(detail, null, crossfade: true);
     }
 
+    /// <summary>Switches the history chart between the 5-hour and weekly windows; the curves draw in again.</summary>
+    private void SetHistoryRange(PanelSurface panel, bool weekly)
+    {
+        Interacted?.Invoke();
+        if (panel.HistoryWeekly == weekly) return;
+        panel.HistoryWeekly = weekly;
+        if (_animate)
+        {
+            _meter.Jump(0);
+            _meter.To(1, Motion.Fill);
+            StartFrames();
+        }
+        Refresh();
+    }
+
     private void SetPage(int page)
     {
         page = Math.Clamp(page, 0, PanelSurface.PageCount - 1);
@@ -882,6 +884,7 @@ internal sealed class UsageIsland : IDisposable
         _panel.Page = page;
         _panel.HoverTab = -1;
         _panel.HoverRow = -1;
+        _panel.HoverRange = -1;
         AimTab(snap: false);
         Display(_panel, null, crossfade: true);
     }

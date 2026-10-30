@@ -14,6 +14,27 @@ namespace TrayUsage;
 /// <summary>Spring constants for a unit mass: acceleration = -Stiffness * offset - Damping * velocity.</summary>
 internal readonly record struct Tuning(double Stiffness, double Damping);
 
+/// <summary>
+/// How a <see cref="Spring"/> travels to a new target: the spring itself, and whether a shrinking value is stopped at its target
+/// (<paramref name="Floor"/>: a shape that gets smaller never squashes below its final size, an alpha never goes negative) or may
+/// swing past it and come back.
+/// </summary>
+internal readonly record struct Move(Tuning Spring, bool Floor);
+
+/// <summary>
+/// Every spring and every duration of the island's motion, in one place. Code never writes a spring constant, a bounce or a delay
+/// of its own: it picks a role below, so a feel is changed here once and cannot drift between call sites.
+/// <list type="table">
+/// <item><term>Open</term><description>the island appears (bouncy)</description></item>
+/// <item><term>Close</term><description>the island leaves (smooth, no bounce on the way in)</description></item>
+/// <item><term>Morph</term><description>one surface becomes another (snappy)</description></item>
+/// <item><term>Page</term><description>another page of the same surface; swings past on the way in as well</description></item>
+/// <item><term>Rise</term><description>vertical position and hover lift</description></item>
+/// <item><term>Fade</term><description>every opacity: content, outgoing content, window</description></item>
+/// <item><term>Slide</term><description>tab highlight, gear, switch knobs</description></item>
+/// <item><term>Fill</term><description>meters and the history chart drawing in (never overshoots 100 %)</description></item>
+/// </list>
+/// </summary>
 internal static class Motion
 {
     /// <summary>SwiftUI's <c>.spring(duration:bounce:)</c> as spring constants: stiffness (2π/duration)², damping 2(1 − bounce)·2π/duration.</summary>
@@ -24,42 +45,69 @@ internal static class Motion
     }
 
     // SwiftUI's presets with duration 0.4 s: .bouncy (bounce 0.3), .smooth (0), .snappy (0.15).
-    public static readonly Tuning Bouncy = FromSwiftUI(0.4, 0.3);
-    public static readonly Tuning Smooth = FromSwiftUI(0.4, 0);
-    public static readonly Tuning Snappy = FromSwiftUI(0.4, 0.15);
-    // Not from SwiftUI's presets: a page switch inside one surface. Snappy overshoots only 0.6 %, too little to see on a tab change.
-    public static readonly Tuning Page = FromSwiftUI(0.45, 0.35);
-    public static readonly Tuning Top = new(300, 34.6);
-    public static readonly Tuning Fade = new(700, 52.9);
+    public static readonly Move Open = new(FromSwiftUI(0.4, 0.3), Floor: true);
+    public static readonly Move Close = new(FromSwiftUI(0.4, 0), Floor: true);
+    public static readonly Move Morph = new(FromSwiftUI(0.4, 0.15), Floor: true);
+    // Not a SwiftUI preset: Morph overshoots only 0.6 %, too little to see on a tab change.
+    public static readonly Move Page = new(FromSwiftUI(0.45, 0.35), Floor: false);
+    public static readonly Move Rise = new(new(300, 34.6), Floor: true);
+    public static readonly Move Fade = new(new(700, 52.9), Floor: true);
     // Not from Oyenza: tab indicator (zeta 0.75, a hair of overshoot) and meter fill (critical, never overshoots 100 %).
-    public static readonly Tuning Tab = new(520, 34.2);
-    public static readonly Tuning Meter = new(90, 19.0);
+    public static readonly Move Slide = new(new(520, 34.2), Floor: false);
+    public static readonly Move Fill = new(new(90, 19.0), Floor: false);
+
+    /// <summary>Seconds the content waits for the shape before it fades in: a growing shape is read sooner than a shrinking one.</summary>
+    public const double GrowDelay = 0.03, ShrinkDelay = 0.05;
+
+    /// <summary>Notice glow: one pulse lasts this long (twice over for warnings).</summary>
+    public const double GlowSeconds = 1.8;
+
+    /// <summary>A working session's ring makes one turn in this many seconds.</summary>
+    public const double SweepSeconds = 1.1;
+
+    /// <summary>DIPs the entering content drops through, how much of its height it is squeezed to at the start, and how small outgoing content gets.</summary>
+    public const float ContentDrop = 2, EnterSqueeze = 0.6f, GhostMinScale = 0.6f;
+
+    /// <summary>The resting capsule under the pointer: grows by <c>LiftSize</c> DIPs, floats up <c>LiftTop</c> and rounds <c>LiftRadius</c> more.</summary>
+    public const float LiftSize = 6, LiftTop = 2, LiftRadius = 3;
+
+    /// <summary>Integration: 2 ms substeps keep the stiffest spring (radius, 1200) stable; a stalled frame advances at most 50 ms.</summary>
+    public const double Substep = 0.002, MaxFrame = 0.05;
 }
 
-/// <summary>One animated value. A shrinking spring never drops below its target, so shapes do not squash.</summary>
+/// <summary>
+/// One animated value. Create it with <see cref="Pixels"/> or <see cref="Unit"/> so it knows when it has come to rest; the island
+/// advances, snaps and checks every spring it owns the same way, so a new spring only has to be added to its list.
+/// </summary>
 internal sealed class Spring
 {
-    private Tuning _tuning = Motion.Fade;
-    private bool _shrinking;
+    private Tuning _tuning = Motion.Fade.Spring;
+    private bool _floored;
+    private readonly double _restPosition, _restVelocity;
+    private double _velocity;
 
-    public Spring(double initial) => Value = Target = initial;
+    private Spring(double initial, double restPosition, double restVelocity)
+    {
+        Value = Target = initial;
+        (_restPosition, _restVelocity) = (restPosition, restVelocity);
+    }
+
+    /// <summary>A value in DIPs or degrees: rests within 0.02 of its target.</summary>
+    public static Spring Pixels(double initial) => new(initial, 0.02, 0.2);
+
+    /// <summary>A value between 0 and 1 (opacity, progress): rests within 0.002 of its target.</summary>
+    public static Spring Unit(double initial) => new(initial, 0.002, 0.02);
 
     public double Value { get; private set; }
     public double Target { get; private set; }
-    private double _velocity;
 
-    public void Retarget(double target, Tuning grow, Tuning shrink)
-    {
-        _shrinking = target < Value;
-        _tuning = _shrinking ? shrink : grow;
-        Target = target;
-    }
+    public bool IsSettled => Math.Abs(Value - Target) < _restPosition && Math.Abs(_velocity) < _restVelocity;
 
-    /// <summary>Retarget without the shrink floor: the value may overshoot on either side.</summary>
-    public void Aim(double target, Tuning tuning)
+    /// <summary>Aims at <paramref name="target"/> the way <paramref name="move"/> says.</summary>
+    public void To(double target, Move move)
     {
-        _shrinking = false;
-        _tuning = tuning;
+        _floored = move.Floor && target < Value;
+        _tuning = move.Spring;
         Target = target;
     }
 
@@ -75,15 +123,12 @@ internal sealed class Spring
     {
         _velocity += (-_tuning.Stiffness * (Value - Target) - _tuning.Damping * _velocity) * dt;
         Value += _velocity * dt;
-        if (_shrinking && Value < Target)
+        if (_floored && Value < Target)
         {
             Value = Target;
             if (_velocity < 0) _velocity = 0;
         }
     }
-
-    public bool Settled(double position, double velocity) =>
-        Math.Abs(Value - Target) < position && Math.Abs(_velocity) < velocity;
 }
 
 /// <summary>

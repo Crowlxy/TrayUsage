@@ -8,7 +8,7 @@ No code was copied; only numbers and the order of events were taken, to follow t
 
 | Where | What follows DynamicNotchKit |
 | --- | --- |
-| `IslandMotion.cs` `Bouncy`, `Smooth`, `Snappy` | Opening is a bouncy spring of 0.4 s, closing a smooth one of 0.4 s, morphing a snappy one of 0.4 s (SwiftUI's presets, converted to stiffness and damping) |
+| `IslandMotion.cs` `Motion.Open`, `Motion.Close`, `Motion.Morph` | Opening is a bouncy spring of 0.4 s, closing a smooth one of 0.4 s, morphing a snappy one of 0.4 s (SwiftUI's presets, converted to stiffness and damping) |
 | `UsageIsland.cs` `FadeOutDelay`, `Motion.Vanish` | On closing the content leaves first; the window fades 0.25 s later, over 0.15 s |
 | `UsageIsland.cs` `DrawBlurFaded` | Content enters blurred, squeezed to 0.6 of its height from the top, fading in |
 
@@ -74,3 +74,18 @@ The notice detail card (task, highlighted message with choices, tool chips, figu
 ## Noto Sans JP (font)
 
 The island draws its text in Noto Sans JP (SIL Open Font License 1.1, https://fonts.google.com/noto/specimen/Noto+Sans+JP) when it is installed on the PC. The font is not bundled or redistributed; without it the island falls back to Segoe UI.
+
+## Open Claude UI (design reference for colour, type and the usage verdict)
+
+[Open Claude UI](https://github.com/Caho1/open-claude-ui) (MIT License, Copyright (c) 2026 Caho1), read from `main` at commit
+`c1f923ae0051a871941b98a0e2e3183a545e6a85` (`code-examples/cds-theme.css`, `SegmentedControl.tsx`, `ClaudeMotionPresets.ts`), a write-up of the
+Claude Design System. No code was copied; only numbers and ideas, to make the island as easy to read as Claude's own screens:
+
+| Where | What follows it |
+| --- | --- |
+| `IslandStyle.cs` `Primary`, `Secondary`, `Tertiary` | Warm gray ramp for text on black: gray-30, gray-200, gray-350 (higher contrast than the neutral grays used before) |
+| `IslandStyle.cs` `Alpha1`..`Alpha4`, `Thumb` | Dark-mode alpha steps (white 5 / 9 / 18 / 30 %) for hover, hairlines, tracks and dividers; gray-750 (`#2c2c2a`) for the raised pill of tabs and segmented controls |
+| `IslandStyle.cs` `ClaudeAccent` | `--cds-clay` (`#d97757`) as Claude Code's colour |
+| `IslandStyle.cs` type scale | Body 13 px (the chat body is 13.2 px), so the island's text is 12 / 13 / 14 / 16 px |
+| `IslandMotion.cs` `Slide` | Segmented thumb spring of stiffness 500 and damping 35, which the tab highlight already matched (520 / 34.2) |
+| `UsagePace.cs`, `IslandSurfaces.cs` `DrawPace` | A one-sentence plain-language verdict under each provider, as on Claude's own usage screen (idea only; the projection rule is our own) |

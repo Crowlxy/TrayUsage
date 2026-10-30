@@ -72,6 +72,7 @@ internal sealed class UsageContext : ApplicationContext
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
     private readonly UsageIsland _island = new();
+    private readonly UsageHistory _history = new();
     private readonly HoverTrigger _hover;
     private CapsLockHook? _capsLock;
     private ProviderUsage? _claudeUsage;
@@ -116,6 +117,7 @@ internal sealed class UsageContext : ApplicationContext
             if (_previewTimer.Enabled) { _previewTimer.Stop(); _previewTimer.Start(); } // a panel opened from the tray stays while it is used
             if (_detail is not null) { _doneTimer.Stop(); _doneTimer.Start(); } // so does a detail card
         };
+        _island.SetHistory(_history);
         _island.SettingsProvider = SettingRows;
         _island.SettingChanged += OnIslandSetting;
         _island.NoticeClicked += OnNoticeClicked;
@@ -247,19 +249,20 @@ internal sealed class UsageContext : ApplicationContext
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
         try { startup = StartupRegistration.IsEnabled(); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException) { }
+        // Rows of a group are listed together; the settings page puts each group under its own heading.
         return
         [
-            new("notify", "完了を通知", [], Flag(ActivitySettings.NotifyCompletion)),
-            new("question", "質問待ちを通知", [], Flag(ActivitySettings.NotifyQuestion)),
-            new("quota", "使用量の警告・リセットを通知", [], Flag(ActivitySettings.NotifyQuota)),
-            new("hook", "承認待ちを通知（Hook を設置）", [], hookInstalled ? 1 : 0),
-            new("progress", "実行中の進捗を表示", [], Flag(ActivitySettings.ShowProgress)),
-            new("fullscreen", "全画面アプリ中は通知しない", [], Flag(ActivitySettings.FullscreenQuiet)),
-            new("hover", "上端ホバーで開く", [], Flag(ActivitySettings.HoverOpen)),
-            new("delay", "ホバーの待ち時間", DelayLabels, Math.Max(0, Array.FindIndex(HoverDelays, d => d.Ms == delay))),
-            new("theme", "テーマ", ["Classic", "Pill"], Math.Clamp(ActivitySettings.GetInt(ActivitySettings.Theme, 0), 0, Themes.Length - 1)),
-            new("clock", "時計を表示", [], Flag(ActivitySettings.ShowClock)),
-            new("startup", "Windows 起動時に実行", [], startup ? 1 : 0)
+            new("notify", "通知", "完了を通知", [], Flag(ActivitySettings.NotifyCompletion)),
+            new("question", "通知", "質問待ちを通知", [], Flag(ActivitySettings.NotifyQuestion)),
+            new("quota", "通知", "使用量の警告・リセットを通知", [], Flag(ActivitySettings.NotifyQuota)),
+            new("hook", "通知", "承認待ちを通知 (Hook)", [], hookInstalled ? 1 : 0),
+            new("fullscreen", "通知", "全画面アプリ中は通知しない", [], Flag(ActivitySettings.FullscreenQuiet)),
+            new("theme", "表示", "テーマ", ["Classic", "Pill"], Math.Clamp(ActivitySettings.GetInt(ActivitySettings.Theme, 0), 0, Themes.Length - 1)),
+            new("clock", "表示", "時計を表示", [], Flag(ActivitySettings.ShowClock)),
+            new("progress", "表示", "実行中の進捗を表示", [], Flag(ActivitySettings.ShowProgress)),
+            new("hover", "上端ホバー", "上端ホバーで開く", [], Flag(ActivitySettings.HoverOpen)),
+            new("delay", "上端ホバー", "待ち時間", DelayLabels, Math.Max(0, Array.FindIndex(HoverDelays, d => d.Ms == delay))),
+            new("startup", "システム", "Windows 起動時に実行", [], startup ? 1 : 0)
         ];
     }
 
@@ -611,6 +614,7 @@ internal sealed class UsageContext : ApplicationContext
             SetProviderMenu(_claude, "Claude Code", claude);
             SetProviderMenu(_codex, "Codex", codex);
             _updated.Text = $"更新: {now:HH:mm:ss}";
+            _history.Record(DateTimeOffset.Now, claude, codex);
             _island.SetUsage(claude, codex);
             AlertQuota(AgentKind.Claude, claude);
             AlertQuota(AgentKind.Codex, codex);

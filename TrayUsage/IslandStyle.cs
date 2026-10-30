@@ -19,17 +19,24 @@ internal static class TimeText
     }
 }
 
-/// <summary>Palette, type scale (11 / 12 / 13 / 15, nothing smaller) and drawing helpers shared by every island surface.</summary>
+/// <summary>Palette, type scale (12 / 13 / 14 / 16, nothing smaller) and drawing helpers shared by every island surface.</summary>
 internal sealed class IslandStyle : IDisposable
 {
-    // Text is white at 0.96 / 0.62 / 0.50 opacity, as on Oyenza's black surfaces.
-    public static readonly Color Primary = Color.FromArgb(245, 245, 245);
-    public static readonly Color Secondary = Color.FromArgb(158, 158, 158);
-    public static readonly Color Tertiary = Color.FromArgb(128, 128, 128);
+    // Text and fills follow the Claude Design System's warm gray ramp (Open Claude UI, MIT, cds-theme.css): gray-30 / gray-200 / gray-350
+    // for text on black (about 19 : 1, 11 : 1, 7 : 1, where the old neutral grays gave 7 : 1 and 5 : 1), gray-750 for a raised pill,
+    // and the white alpha steps 5 / 9 / 18 / 30 % for hover, hairlines, tracks and heavy dividers. See THIRD_PARTY_NOTICES.md.
+    public static readonly Color Primary = Color.FromArgb(246, 246, 244);
+    public static readonly Color Secondary = Color.FromArgb(195, 194, 183);
+    public static readonly Color Tertiary = Color.FromArgb(151, 149, 141);
+    public static readonly Color Thumb = Color.FromArgb(44, 44, 42);
+    public static readonly Color Alpha1 = Color.FromArgb(13, 255, 255, 255);
+    public static readonly Color Alpha2 = Color.FromArgb(23, 255, 255, 255);
+    public static readonly Color Alpha3 = Color.FromArgb(46, 255, 255, 255);
+    public static readonly Color Alpha4 = Color.FromArgb(77, 255, 255, 255);
     public static readonly Color Amber = Color.FromArgb(255, 214, 10);
     public static readonly Color Warning = Color.FromArgb(255, 69, 58);
     public static readonly Color Success = Color.FromArgb(48, 209, 88);
-    public static readonly Color ClaudeAccent = Color.FromArgb(236, 150, 108);
+    public static readonly Color ClaudeAccent = Color.FromArgb(217, 119, 87); // CDS --cds-clay
     public static readonly Color CodexAccent = Color.FromArgb(138, 152, 255);
 
     /// <summary>Quota level colour: green under 70 % used, amber from 70, red from 90 (the scale Agent HUD uses).</summary>
@@ -44,10 +51,10 @@ internal sealed class IslandStyle : IDisposable
 
     public IslandStyle()
     {
-        Name = new Font(_display, 13, FontStyle.Regular, GraphicsUnit.Pixel);
-        Value = new Font(_display, 15, FontStyle.Regular, GraphicsUnit.Pixel);
-        Body = new Font(_text, 12, FontStyle.Regular, GraphicsUnit.Pixel);
-        Caption = new Font(_text, 11, FontStyle.Regular, GraphicsUnit.Pixel);
+        Name = new Font(_display, 14, FontStyle.Regular, GraphicsUnit.Pixel);
+        Value = new Font(_display, 16, FontStyle.Regular, GraphicsUnit.Pixel);
+        Body = new Font(_text, 13, FontStyle.Regular, GraphicsUnit.Pixel); // CDS chat body is 13.2 px
+        Caption = new Font(_text, 12, FontStyle.Regular, GraphicsUnit.Pixel);
         ClaudeIcon = LoadIcon("claude-logo.png");
         CodexIcon = LoadIcon("codex-logo.png");
         _measure = Graphics.FromImage(_measureBitmap);
