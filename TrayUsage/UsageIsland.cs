@@ -31,7 +31,7 @@ internal sealed class UsageIsland : IDisposable
     // loop advances, snaps and tests rest on _every, so a spring added to either list is looked after everywhere.
     private readonly Spring _w = Spring.Pixels(PillWidth), _h = Spring.Pixels(PillHeight), _r = Spring.Pixels(PillHeight / 2), _top = Spring.Pixels(0);
     private readonly Spring _contentAlpha = Spring.Unit(0), _ghostAlpha = Spring.Unit(0), _presence = Spring.Unit(0), _lift = Spring.Pixels(0);
-    private readonly Spring _tabX = Spring.Pixels(0), _tabW = Spring.Pixels(0), _meter = Spring.Unit(1), _gear = Spring.Pixels(0);
+    private readonly Spring _dock = Spring.Unit(1), _tabX = Spring.Pixels(0), _tabW = Spring.Pixels(0), _meter = Spring.Unit(1), _gear = Spring.Pixels(0);
     private readonly Spring[] _knobs = Enumerable.Range(0, PanelSurface.MaxSettingRows).Select(_ => Spring.Unit(0)).ToArray();
     private readonly float[] _knobValues = new float[PanelSurface.MaxSettingRows];
     private int _clockMinute = -1, _returnPage;
@@ -61,11 +61,11 @@ internal sealed class UsageIsland : IDisposable
     public UsageIsland()
     {
         _panel = new PanelSurface(_style);
-        _all = [_w, _h, _r, _top, _contentAlpha, _ghostAlpha, _presence, _lift, _tabX, _tabW, _meter, _gear];
+        _all = [_w, _h, _r, _top, _dock, _contentAlpha, _ghostAlpha, _presence, _lift, _tabX, _tabW, _meter, _gear];
         _every = [.. _all, .. _knobs];
     }
 
-    private bool HasLiveIcons => _shown && _surface is { LiveIcons.Count: > 0 };
+    private bool HasLiveIcons => _shown && _surface is { LiveIcons.Count: > 0 } or { LiveSpinners.Count: > 0 };
 
     /// <summary>
     /// A working session's logo moves every frame, on the same vsync pacer as the springs. Every step presents: the pacer
@@ -83,6 +83,21 @@ internal sealed class UsageIsland : IDisposable
     private bool Docked => _theme != IslandTheme.Pill;
     private float RestTop => Docked ? 0 : TopGap;
 
+    /// <summary>How docked the outline is right now (1 hangs from the edge with shoulders, 0 floats as a capsule); it moves with <see cref="_dock"/> when the theme changes.</summary>
+    private Action? _themeLater;
+
+    /// <summary>Starts the second half of a theme change once the first has got far enough: the body is on the edge, or the shoulders are gone.</summary>
+    private void ReleaseThemeMove()
+    {
+        if (_themeLater is null) return;
+        var ready = Docked ? _top.Value <= 0.5 : _dock.Value <= 0.5;
+        if (!ready && _shown) return;
+        _themeLater();
+        _themeLater = null;
+    }
+
+    private float DockAmount => (float)Math.Clamp(_dock.Value, 0, 1);
+
     /// <summary>Where the closing pill slides to: past the point where its shadow clears the screen edge, so the spring crosses it instead of crawling in.</summary>
     private const float RetractTop = -(PillHeight + Shadow.Drop + Shadow.Reach + 24);
 
@@ -93,9 +108,31 @@ internal sealed class UsageIsland : IDisposable
         {
             if (_theme == value) return;
             _theme = value;
-            DisposeBitmaps();
-            if (!Visible || !_shown || _surface is null) return;
-            Display(_surface, null, crossfade: false);
+            if (!Visible || _surface is null) return;
+            // Changing theme under an open island is two motions, one after the other, content untouched. Pill to Classic: the capsule
+            // rises until it sticks to the edge, and only then do its corners square off and the shoulders reach out to the sides.
+            // Classic to Pill: the shoulders curl away and the corners round, and only then does the capsule drop from the edge.
+            if (!_animate)
+            {
+                _dock.To(Docked ? 1 : 0, Motion.Morph);
+                _dock.Snap();
+                if (_shown) _top.To(RestTop, Motion.Morph);
+                _top.Snap();
+                _themeLater = null;
+                if (_shown) Present(releaseCanvas: !KeepCanvas);
+                return;
+            }
+            if (Docked)
+            {
+                if (_shown) _top.To(0, Motion.Morph);
+                _themeLater = () => _dock.To(1, Motion.Morph);
+            }
+            else
+            {
+                _dock.To(0, Motion.Morph);
+                _themeLater = _shown ? () => _top.To(TopGap, Motion.Morph) : null;
+            }
+            StartFrames();
         }
     }
 
@@ -122,14 +159,21 @@ internal sealed class UsageIsland : IDisposable
 
     public NoticeData? CurrentNotice => _shown ? (_surface as NoticeSurface)?.Data : null;
 
+    /// <summary>The card's "more" button was clicked: the owner opens the Done / History / Settings panel in its place.</summary>
+    public event Action? MoreRequested;
+
     /// <summary>A notice's detail card is up (a click on it fires <see cref="NoticeClicked"/> too, to close it).</summary>
-    public bool ShowingDetail => _shown && _surface is DetailSurface;
+    public bool ShowingDetail => _shown && _surface is DetailSurface or ProgressSurface { Menu: false };
 
-    private bool WantsHand => _shown && (_surface is NoticeSurface or DetailSurface ||
-        _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverRow >= 0 || p.HoverRange >= 0));
+    private bool WantsHand => _shown && (_surface is NoticeSurface or DetailSurface or IdleSurface ||
+        _surface is ProgressSurface { } card && (card.Hover != ProgressHit.None || card.HoverDot >= 0) ||
+        _surface is PanelSurface { } p && (p.HoverTab >= 0 || p.HoverGear || p.HoverBackButton || p.HoverRow >= 0 || p.HoverRange >= 0));
 
-    public IslandMode Mode => _surface is PanelSurface ? IslandMode.Panel : IslandMode.Notice;
-    public bool PanelActive => Visible && _shown && _surface is PanelSurface;
+    // The main menu is the card opened by the user (or by Caps Lock / hover) and the panel behind its "more" button; a card opened by a
+    // notice is a notice, and goes with it.
+    private bool IsMenu => _surface is PanelSurface or ProgressSurface { Menu: true };
+    public IslandMode Mode => IsMenu ? IslandMode.Panel : IslandMode.Notice;
+    public bool PanelActive => Visible && _shown && IsMenu;
 
     /// <summary>The visible body in screen pixels, or null when nothing is shown.</summary>
     public Rectangle? ScreenBody => Visible && _shown && !_bodyPx.IsEmpty
@@ -138,21 +182,51 @@ internal sealed class UsageIsland : IDisposable
 
     public void SetHistory(UsageHistory history) => _panel.SetHistory(history);
 
+    private ProviderUsage? _claudeUsage, _codexUsage;
+
     public void SetUsage(ProviderUsage claude, ProviderUsage codex)
     {
-        _panel.SetUsage(claude, codex);
+        (_claudeUsage, _codexUsage) = (claude, codex);
         _usedPercent = new[] { claude.FiveHour?.UsedPercent, claude.Weekly?.UsedPercent, codex.FiveHour?.UsedPercent, codex.Weekly?.UsedPercent }.Max() ?? 0;
-        if (_surface == _panel && _shown)
+        if (_surface is ProgressSurface card && _shown)
         {
-            SetGlow(_panel, pulse: false);
+            card.SetUsage(claude, codex);
+            SetGlow(card, pulse: false);
             Refresh();
         }
+        else if (_surface is IdleSurface idle && _shown && idle.SetPercent(_usedPercent)) Refresh();
     }
 
-    public void SetActivity(IReadOnlyList<AgentSession> running, IReadOnlyList<CompletedTurn> recent)
+    /// <summary>A click on the resting pill: the owner opens the main menu.</summary>
+    public event Action? PillClicked;
+
+    /// <summary>
+    /// The resting pill of the Pill theme: a small capsule that stays up while nothing else is shown, with a ring that fills with
+    /// the heaviest usage. Notices and the menu morph out of it and back into it.
+    /// </summary>
+    public void ShowIdle()
+    {
+        if (_shown && _surface is IdleSurface current)
+        {
+            if (current.SetPercent(_usedPercent)) Refresh();
+            return;
+        }
+        Display(new IdleSurface(_usedPercent), null, crossfade: Visible && _shown);
+    }
+
+    /// <summary>The sessions the card pages through (a running turn each, or the finished turn that is in view); an open card follows them.</summary>
+    public void SetSessions(IReadOnlyList<NoticeData> pages)
+    {
+        _cardPages = pages;
+        if (!_shown || _surface is not ProgressSurface card || !card.SetPages(pages)) return;
+        SetGlow(card, pulse: false); // a turn may have just finished
+        Refresh();
+    }
+
+    public void SetActivity(IReadOnlyList<CompletedTurn> recent)
     {
         var before = _panel.Size;
-        _panel.SetActivity(running, recent);
+        _panel.SetActivity(recent);
         if (_surface != _panel || !_shown) return;
         AimTab(snap: false);
         if (_panel.Size != before) Display(_panel, null, crossfade: false);
@@ -167,7 +241,7 @@ internal sealed class UsageIsland : IDisposable
         var minute = DateTime.Now.Minute;
         var clockChanged = minute != _clockMinute && _panel.ShowClock;
         _clockMinute = minute;
-        if (_panel.Page == PanelSurface.RunningPage || clockChanged) Refresh();
+        if (clockChanged) Refresh();
         UpdateSpin();
     }
 
@@ -193,7 +267,38 @@ internal sealed class UsageIsland : IDisposable
     /// <summary>Opens the panel on the settings page (from the tray menu).</summary>
     public void ShowSettings(Screen? screen = null) => OpenPanel(screen, settings: true);
 
-    public void ShowPanel(Screen? screen = null) => OpenPanel(screen, settings: false);
+    /// <summary>Opens the Done / History panel (the card's "more" button).</summary>
+    public void ShowMore() => OpenPanel(null, settings: false);
+
+    /// <summary>Opens the main menu: the card, on the tab it was last left on.</summary>
+    public void ShowPanel(Screen? screen = null)
+    {
+        if (_shown && _surface is ProgressSurface { Menu: true }) return;
+        OpenCard(screen, menu: true, focus: null);
+    }
+
+    private IReadOnlyList<NoticeData> _cardPages = [];
+    private int _cardTab = ProgressSurface.UsagePage;
+
+    /// <summary>Opens the card on the page of <paramref name="focus"/>'s session, as a notice (a notice not among the sessions gets a page of its own).</summary>
+    private void OpenCard(Screen? screen, bool menu, NoticeData? focus)
+    {
+        var pages = _cardPages;
+        var index = 0;
+        if (focus is not null)
+        {
+            var key = ProgressSurface.KeyOf(focus);
+            index = pages.ToList().FindIndex(page => ProgressSurface.KeyOf(page) == key);
+            if (index < 0)
+            {
+                pages = [focus, .. pages];
+                index = 0;
+            }
+        }
+        var card = new ProgressSurface(_style, pages, index, menu, menu ? _cardTab : ProgressSurface.ProgressPage);
+        card.SetUsage(_claudeUsage, _codexUsage);
+        Display(card, screen, crossfade: Visible && _shown);
+    }
 
     private void OpenPanel(Screen? screen, bool settings)
     {
@@ -206,7 +311,7 @@ internal sealed class UsageIsland : IDisposable
         else if (_panel.Page == PanelSurface.SettingsPage && !showing) _panel.Page = _returnPage; // settings are not the resting page
         RefreshSettings();
         _clockMinute = DateTime.Now.Minute;
-        Display(_panel, screen, crossfade: Visible && _surface is NoticeSurface);
+        Display(_panel, screen, crossfade: Visible && _surface is NoticeSurface or ProgressSurface);
     }
 
     public void ShowNotice(NoticeData data)
@@ -222,13 +327,17 @@ internal sealed class UsageIsland : IDisposable
         Display(new NoticeSurface(_style, data), null, crossfade: Visible && _shown);
     }
 
-    /// <summary>Opens the notice into its detail card, morphing the capsule.</summary>
-    public void ShowDetail(NoticeData data) => Display(new DetailSurface(_style, data), null, crossfade: Visible && _shown);
+    /// <summary>Opens the notice into its card, morphing the capsule: the main card on its session for a running or finished turn, the detail card otherwise.</summary>
+    public void ShowDetail(NoticeData data)
+    {
+        if (data.Type is NoticeType.Running or NoticeType.Completed) OpenCard(null, menu: false, focus: data);
+        else Display(new DetailSurface(_style, data), null, crossfade: Visible && _shown);
+    }
 
     /// <summary>The resting capsule lifts a little under the pointer.</summary>
     public void SetPointerOver(bool over)
     {
-        var target = over && _shown && _surface is NoticeSurface ? 1 : 0;
+        var target = over && _shown && _surface is NoticeSurface or IdleSurface ? 1 : 0;
         if (target == _lift.Target || !Visible) return;
         _lift.To(target, Motion.Rise);
         if (!_animate) _lift.Snap();
@@ -281,6 +390,8 @@ internal sealed class UsageIsland : IDisposable
             _w.Jump(PillWidth);
             _h.Jump(PillHeight);
             _r.Jump(PillHeight / 2);
+            _dock.Jump(Docked ? 1 : 0);
+            _themeLater = null;
             _meter.Jump(1);
             DisposeBitmaps();
             _window ??= new IslandWindow(this);
@@ -292,7 +403,7 @@ internal sealed class UsageIsland : IDisposable
         {
             // The old content fades and shrinks away while the new one fades in. Between two pages of the same panel
             // it only fades in place, and the header stays put: scaled or shifted text would shimmer.
-            _pageSwitch = surface == _surface && surface is PanelSurface or DetailSurface;
+            _pageSwitch = surface == _surface && surface is PanelSurface or DetailSurface or ProgressSurface;
             _ghostScales = !_pageSwitch;
         }
         else if (crossfade || _surface != surface)
@@ -327,7 +438,7 @@ internal sealed class UsageIsland : IDisposable
             AimTab(snap: !wasVisible);
             _panelPage = panel.Page;
             // The usage meters and the history curves fill in after the shape has settled enough to read them.
-            if (opening && panel.Page is PanelSurface.UsagePage or PanelSurface.HistoryPage && _animate)
+            if (opening && panel.Page == PanelSurface.HistoryPage && _animate)
             {
                 _meter.Jump(0);
                 _meterArmed = true;
@@ -362,6 +473,16 @@ internal sealed class UsageIsland : IDisposable
             case DetailSurface { Data.Type: not NoticeType.Running } detail:
                 _glowColor = NoticeLook.Accent(detail.Data);
                 _glowRest = 0.3f;
+                _glowDouble = false;
+                break;
+            case ProgressSurface { Menu: false, Current.Type: NoticeType.Completed }:
+                _glowColor = IslandStyle.Success;
+                _glowRest = 0.3f;
+                _glowDouble = false;
+                break;
+            case ProgressSurface { Menu: true } when _usedPercent >= 70:
+                _glowColor = IslandStyle.Level(_usedPercent);
+                _glowRest = 0.22f;
                 _glowDouble = false;
                 break;
             case PanelSurface when _usedPercent >= 70:
@@ -465,6 +586,7 @@ internal sealed class UsageIsland : IDisposable
             var dt = Math.Min(Motion.Substep, remaining);
             foreach (var spring in _every) spring.Advance(dt);
         }
+        ReleaseThemeMove();
         if (_glowTime >= 0 && (_glowTime += elapsed) >= Motion.GlowSeconds) _glowTime = -1;
         if (_pageSwitch && _contentAlpha.Value >= 0.999 && _contentArm <= 0) _pageSwitch = false;
         if (_contentArm > 0 && (_contentArm -= elapsed) <= 0)
@@ -480,7 +602,7 @@ internal sealed class UsageIsland : IDisposable
             HideNow();
             return;
         }
-        var springsSettled = _contentArm <= 0 && !_meterArmed && _glowTime < 0 && _every.All(s => s.IsSettled);
+        var springsSettled = _contentArm <= 0 && !_meterArmed && _glowTime < 0 && _themeLater is null && _every.All(s => s.IsSettled);
         var live = HasLiveIcons;
         var settled = springsSettled && !live;
         if (springsSettled)
@@ -505,7 +627,7 @@ internal sealed class UsageIsland : IDisposable
     }
 
     /// <summary>While a panel or card is up its canvas stays: reallocating it for the closing frames costs the first frames of the close.</summary>
-    private bool KeepCanvas => _shown && _surface is not NoticeSurface;
+    private bool KeepCanvas => _shown && _surface is not (NoticeSurface or IdleSurface);
 
     private void Present(bool releaseCanvas)
     {
@@ -526,8 +648,8 @@ internal sealed class UsageIsland : IDisposable
         }
     }
 
-    private Size CanvasSize => new((int)Math.Ceiling((PanelSurface.MaxWidth * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
-        (int)Math.Ceiling((TopGap + PanelSurface.MaxHeight * MaxOvershoot + Shadow.Margin) * _scale));
+    private Size CanvasSize => new((int)Math.Ceiling((Math.Max(PanelSurface.MaxWidth, ProgressSurface.CardWidth) * MaxOvershoot + (Shadow.Margin + Shoulder) * 2) * _scale),
+        (int)Math.Ceiling((TopGap + Math.Max(PanelSurface.MaxHeight, ProgressSurface.CardHeight) * MaxOvershoot + Shadow.Margin) * _scale));
 
     private void Draw(Graphics g)
     {
@@ -547,18 +669,21 @@ internal sealed class UsageIsland : IDisposable
         var lift = (float)Math.Clamp(_lift.Value, 0, 1.2);
         var width = ((float)_w.Value + Motion.LiftSize * lift) * s;
         var height = ((float)_h.Value + Motion.LiftSize * lift) * s;
-        var top = ((float)_top.Value - (Docked ? 0 : Motion.LiftTop * lift)) * s; // hanging islands stay on the edge
+        var dock = DockAmount;
+        var top = ((float)_top.Value - Motion.LiftTop * lift * (1 - dock)) * s; // hanging islands stay on the edge
         var body = new RectangleF((CanvasSize.Width - width) / 2, top, width, height);
         var radius = Math.Clamp(((float)_r.Value + Motion.LiftRadius * lift) * s, 0, Math.Min(width, height) / 2);
         _bodyPx = body;
-        var shoulder = Docked ? Shoulder * s : 0;
+        // Shoulders curl away over the first half of the dock spring, the top corners round over the second: never both at once.
+        var shoulder = Shoulder * s * Math.Clamp(dock * 2 - 1, 0, 1);
+        var topRound = radius * Math.Clamp(1 - dock * 2, 0, 1);
 
         foreach (var (inflate, alpha) in Shadow.Layers)
         {
             var spread = inflate * s;
             var halo = RectangleF.Inflate(body, spread, spread);
             halo.Offset(0, Shadow.Drop * s);
-            using var haloPath = Outline(halo, radius + spread, shoulder > 0 ? shoulder + spread : 0);
+            using var haloPath = Outline(halo, radius + spread, shoulder > 0 ? shoulder + spread : 0, topRound > 0 ? topRound + spread : 0);
             using var haloBrush = new SolidBrush(Color.FromArgb((int)Math.Round(255 * alpha * presence), 0, 0, 0));
             g.FillPath(haloBrush, haloPath);
         }
@@ -569,33 +694,34 @@ internal sealed class UsageIsland : IDisposable
             {
                 var spread = inflate * s;
                 var halo = RectangleF.Inflate(body, spread, spread);
-                using var haloPath = Outline(halo, radius + spread, shoulder > 0 ? shoulder + spread : 0);
+                using var haloPath = Outline(halo, radius + spread, shoulder > 0 ? shoulder + spread : 0, topRound > 0 ? topRound + spread : 0);
                 using var haloBrush = new SolidBrush(Color.FromArgb((int)Math.Round(255 * Math.Min(1, alpha * 1.3f * glow)), _glowColor));
                 g.FillPath(haloBrush, haloPath);
             }
         }
-        using var bodyPath = Outline(body, radius, shoulder);
+        using var bodyPath = Outline(body, radius, shoulder, topRound);
         using (var fill = new SolidBrush(Color.FromArgb((int)Math.Round(255 * presence), 0, 0, 0)))
             g.FillPath(fill, bodyPath);
 
-        DrawContent(g, body, radius);
+        DrawContent(g, body, radius, lift);
 
-        using var rimPath = Outline(RectangleF.Inflate(body, -0.5f * s, -0.5f * s), radius - 0.5f * s, shoulder, closed: false);
+        using var rimPath = Outline(RectangleF.Inflate(body, -0.5f * s, -0.5f * s), radius - 0.5f * s, shoulder, topRound > 0 ? topRound - 0.5f * s : 0, closed: false);
         using var rim = new Pen(Color.FromArgb((int)(30 * presence), 255, 255, 255), Math.Max(1, s));
         g.DrawPath(rim, rimPath);
     }
 
-    private void DrawContent(Graphics g, RectangleF body, float radius)
+    private void DrawContent(Graphics g, RectangleF body, float radius, float lift)
     {
         var s = _scale;
         var inset = 1.5f * s;
-        using var clip = Docked
-            ? IslandStyle.DockedPath(new RectangleF(body.X + inset, body.Y, body.Width - 2 * inset, body.Height - inset), radius - inset, 0)
+        using var clip = _dock.Value > 0.001 || Docked
+            ? IslandStyle.DockedPath(new RectangleF(body.X + inset, body.Y + inset * (1 - DockAmount), body.Width - 2 * inset, body.Height - inset * (2 - DockAmount)),
+                radius - inset, 0, true, Math.Max(0, radius - inset) * Math.Clamp(1 - DockAmount * 2, 0, 1))
             : IslandStyle.ContinuousRect(RectangleF.Inflate(body, -inset, -inset), radius - inset);
         g.SetClip(clip);
 
         var headerPx = (int)Math.Ceiling((_surface?.FixedTop ?? 0) * s);
-        var pageSwitch = _pageSwitch && _surface is PanelSurface or DetailSurface;
+        var pageSwitch = _pageSwitch && _surface is PanelSurface or DetailSurface or ProgressSurface;
         if (_ghostBitmap is not null && _ghostAlpha.Value > 0.004 && pageSwitch)
         {
             // Same panel, other page: the old body fades where it stands, pixel for pixel.
@@ -619,7 +745,9 @@ internal sealed class UsageIsland : IDisposable
             var bitmap = _contentBitmap ??= _surface.Render(_style, s);
             // Whole pixels only: ClearType text resampled at a fractional offset shimmers while it moves.
             var drop = pageSwitch ? 0 : (float)Math.Round(Motion.ContentDrop * s * (1 - alpha));
-            var origin = new PointF((float)Math.Round(body.X + body.Width / 2 - bitmap.Width / 2f), (float)Math.Round(body.Top + drop));
+            // The resting capsule swells under the pointer; its content stays in the middle of it, not pinned to the top.
+            var swell = Motion.LiftSize * lift * s / 2;
+            var origin = new PointF((float)Math.Round(body.X + body.Width / 2 - bitmap.Width / 2f), (float)Math.Round(body.Top + swell + drop));
             _contentOrigin = origin;
             if (pageSwitch)
             {
@@ -644,7 +772,23 @@ internal sealed class UsageIsland : IDisposable
             }
         }
         if (_surface is { LiveIcons.Count: > 0 } && alpha > 0.004) DrawLiveIcons(g, alpha);
+        if (_surface is { LiveSpinners.Count: > 0 } && alpha > 0.004) DrawLiveSpinners(g, alpha);
         g.ResetClip();
+    }
+
+    /// <summary>A working turn's spinner: a bare ring with the arc sweeping round it, in the agent's colour.</summary>
+    private void DrawLiveSpinners(Graphics g, double alpha)
+    {
+        var s = _scale;
+        var saved = g.Save();
+        g.ResetTransform();
+        foreach (var (rect, color) in _surface!.LiveSpinners)
+        {
+            var cx = _contentOrigin.X + (rect.X + rect.Width / 2) * s;
+            var cy = _contentOrigin.Y + (rect.Y + rect.Height / 2) * s;
+            DrawSweep(g, cx, cy, rect.Width / 2 * s, s, color, (int)Math.Round(255 * alpha));
+        }
+        g.Restore(saved);
     }
 
     /// <summary>
@@ -677,7 +821,7 @@ internal sealed class UsageIsland : IDisposable
     {
         const long period = (long)(Motion.SweepSeconds * 1000);
         var turn = Environment.TickCount64 % period / (double)period;
-        var length = 70 + 80 * (0.5 - 0.5 * Math.Cos(turn * 2 * Math.PI)); // 70..150 degrees
+        var length = 36 + 44 * (0.5 - 0.5 * Math.Cos(turn * 2 * Math.PI)); // 36..80 degrees
         var ring = new RectangleF(cx - radius, cy - radius, 2 * radius, 2 * radius);
         using var track = new Pen(Color.FromArgb(alpha * 40 / 255, 255, 255, 255), 2f * scale);
         using var sweep = new Pen(Color.FromArgb(alpha, accent), 2f * scale) { StartCap = LineCap.Round, EndCap = LineCap.Round };
@@ -685,8 +829,8 @@ internal sealed class UsageIsland : IDisposable
         g.DrawArc(sweep, ring, (float)(turn * 360 - 90), (float)length);
     }
 
-    private GraphicsPath Outline(RectangleF rect, float radius, float shoulder, bool closed = true) =>
-        Docked ? IslandStyle.DockedPath(rect, radius, shoulder, closed) : IslandStyle.ContinuousRect(rect, radius);
+    private GraphicsPath Outline(RectangleF rect, float radius, float shoulder, float topRound, bool closed = true) =>
+        _dock.Value > 0.001 || Docked ? IslandStyle.DockedPath(rect, radius, shoulder, closed, topRound) : IslandStyle.ContinuousRect(rect, radius);
 
     /// <summary>A bitmap and its blurred copy (the bitmap shrunk, which smooths when drawn large again; GDI+ has no blur).</summary>
     private sealed class BlurCache : IDisposable
@@ -767,6 +911,57 @@ internal sealed class UsageIsland : IDisposable
 
     private void OnMouse(int message, Point client, int delta)
     {
+        if (_surface is ProgressSurface card)
+        {
+            // The card answers its buttons, the two tabs and the pager (dots and wheel). Opened as a notice it goes away with the
+            // pointer, or with its close button once the turn is done; as the main menu it is left to the hover logic and the timers.
+            var spot = new PointF((client.X - _contentOrigin.X) / _scale, (client.Y - _contentOrigin.Y) / _scale);
+            switch (message)
+            {
+                case 0x0200 when _shown: // WM_MOUSEMOVE
+                    var over = card.HitAt(spot, out var overDot);
+                    if (over != card.Hover || overDot != card.HoverDot)
+                    {
+                        card.Hover = over;
+                        card.HoverDot = overDot;
+                        Refresh();
+                    }
+                    break;
+                case 0x0201 when _shown: // WM_LBUTTONDOWN
+                    Interacted?.Invoke();
+                    switch (card.HitAt(spot, out var dot))
+                    {
+                        case ProgressHit.Close: NoticeClicked?.Invoke(); break;
+                        case ProgressHit.Jump:
+                            if (card.Current?.Target is { } target) SessionRequested?.Invoke(target);
+                            break;
+                        case ProgressHit.More: MoreRequested?.Invoke(); break;
+                        case ProgressHit.ProgressTab: SetCardTab(card, ProgressSurface.ProgressPage); break;
+                        case ProgressHit.UsageTab: SetCardTab(card, ProgressSurface.UsagePage); break;
+                        case ProgressHit.Dot: SetCardPage(card, dot); break;
+                    }
+                    break;
+                case 0x020A when _shown && card.Page == ProgressSurface.ProgressPage && card.PageCount > 1: // WM_MOUSEWHEEL
+                    _wheel += delta;
+                    if (Math.Abs(_wheel) >= 120)
+                    {
+                        Interacted?.Invoke();
+                        SetCardPage(card, card.PageIndex + (_wheel < 0 ? 1 : -1));
+                        _wheel = 0;
+                    }
+                    break;
+                case 0x02A3 when _shown: // WM_MOUSELEAVE
+                    if (card.Hover != ProgressHit.None || card.HoverDot >= 0)
+                    {
+                        card.Hover = ProgressHit.None;
+                        card.HoverDot = -1;
+                        Refresh();
+                    }
+                    if (!card.Menu) DetailLeft?.Invoke();
+                    break;
+            }
+            return;
+        }
         if (_surface is DetailSurface detail)
         {
             // The card has one or two screens: a click moves on, and on the last one closes it; the wheel switches screens.
@@ -789,6 +984,15 @@ internal sealed class UsageIsland : IDisposable
             }
             return;
         }
+        if (_surface is IdleSurface)
+        {
+            if (message == 0x0201 && _shown)
+            {
+                Interacted?.Invoke();
+                PillClicked?.Invoke();
+            }
+            return;
+        }
         if (_surface is NoticeSurface)
         {
             if (message == 0x0201 && _shown)
@@ -807,27 +1011,36 @@ internal sealed class UsageIsland : IDisposable
                 var hoverRow = panel.SettingRowAt(point);
                 var hoverGear = panel.GearAt(point);
                 var hoverRange = panel.RangeAt(point);
-                if (hover != panel.HoverTab || hoverRow != panel.HoverRow || hoverGear != panel.HoverGear || hoverRange != panel.HoverRange)
+                var hoverBack = PanelSurface.BackAt(point);
+                if (hover != panel.HoverTab || hoverRow != panel.HoverRow || hoverGear != panel.HoverGear || hoverRange != panel.HoverRange || hoverBack != panel.HoverBackButton)
                 {
                     panel.HoverTab = hover;
                     panel.HoverRow = hoverRow;
                     panel.HoverGear = hoverGear;
                     panel.HoverRange = hoverRange;
+                    panel.HoverBackButton = hoverBack;
                     Refresh();
                 }
                 break;
             case 0x02A3: // WM_MOUSELEAVE
-                if (panel.HoverTab != -1 || panel.HoverRow != -1 || panel.HoverGear || panel.HoverRange != -1)
+                if (panel.HoverTab != -1 || panel.HoverRow != -1 || panel.HoverGear || panel.HoverRange != -1 || panel.HoverBackButton)
                 {
                     panel.HoverTab = -1;
                     panel.HoverRow = -1;
                     panel.HoverGear = false;
                     panel.HoverRange = -1;
+                    panel.HoverBackButton = false;
                     Refresh();
                 }
                 break;
             case 0x0201: // WM_LBUTTONDOWN
-                if (panel.TargetAt(panel.SettingRowAt(point)) is { } session)
+                if (PanelSurface.BackAt(point))
+                {
+                    Interacted?.Invoke();
+                    panel.HoverBackButton = false;
+                    OpenCard(null, menu: true, focus: null);
+                }
+                else if (panel.TargetAt(panel.SettingRowAt(point)) is { } session)
                 {
                     Interacted?.Invoke();
                     SessionRequested?.Invoke(session);
@@ -850,6 +1063,23 @@ internal sealed class UsageIsland : IDisposable
                 }
                 break;
         }
+    }
+
+    /// <summary>Switches the card between 進捗 and 使用状況; the main menu remembers the tab it was left on.</summary>
+    private void SetCardTab(ProgressSurface card, int tab)
+    {
+        if (card.Page == tab) return;
+        card.Page = tab;
+        if (card.Menu) _cardTab = tab;
+        Display(card, null, crossfade: true);
+    }
+
+    /// <summary>Pages to another session.</summary>
+    private void SetCardPage(ProgressSurface card, int index)
+    {
+        if (!card.GoTo(index)) return;
+        SetGlow(card, pulse: false); // the page may be a finished turn, which glows
+        Display(card, null, crossfade: true);
     }
 
     private void SetDetailPage(DetailSurface detail, int page)

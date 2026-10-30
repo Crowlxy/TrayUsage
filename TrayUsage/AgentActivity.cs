@@ -17,8 +17,13 @@ internal sealed record CompletedTurn(AgentKind Kind, string Project, TimeSpan Du
 /// <param name="ContextTokens">Input tokens of the latest request (prompt + cache), i.e. how full the context is.</param>
 /// <param name="Tools">Tool calls made this turn, most used first.</param>
 /// <param name="Question">The question put to the user, with its <paramref name="Choices"/>; <paramref name="Plan"/> is a plan awaiting approval.</param>
+/// <param name="Steps">The latest tool calls of the turn in the order they were made, each marked finished or still running.</param>
 internal sealed record SessionBrief(string? Prompt, string? Reply, string? Model, string? Branch, int ContextTokens,
-    IReadOnlyList<(string Tool, int Count)> Tools, string? Question, IReadOnlyList<string> Choices, string? Plan);
+    IReadOnlyList<(string Tool, int Count)> Tools, string? Question, IReadOnlyList<string> Choices, string? Plan,
+    IReadOnlyList<ProgressStep>? Steps = null);
+
+/// <param name="Tool">The tool's name; <paramref name="Detail"/> is what it was asked to do (the command, the file, the pattern), if the log says.</param>
+internal sealed record ProgressStep(string Tool, string? Detail, bool Done);
 /// <param name="ReadLarge">A first sight read a few MB; the caller may want to collect that garbage.</param>
 /// <summary>Why a session wants a look: a question, a plan awaiting approval, an API error, or a usage limit hit.</summary>
 internal enum AskReason { Question, Plan, Failed, Limited }
@@ -73,16 +78,46 @@ internal sealed partial class ActivityMonitor
         public readonly Dictionary<string, int> Tools = new();
         public List<string> Choices = [];
 
+        // The tool calls of the turn, oldest first. A call is open until its result (matched by id) arrives or the turn ends.
+        private const int MaxSteps = 20;
+        private readonly List<Step> _steps = [];
+        private sealed class Step(string id, string tool, string? detail)
+        {
+            public readonly string Id = id, Tool = tool;
+            public readonly string? Detail = detail;
+            public bool Done;
+        }
+
         public void NewTurn()
         {
             Reply = Question = Plan = null;
             Tools.Clear();
             Choices = [];
+            _steps.Clear();
+        }
+
+        public void AddStep(string? id, string tool, string? detail)
+        {
+            _steps.Add(new Step(id ?? "", tool, detail));
+            if (_steps.Count > MaxSteps) _steps.RemoveAt(0);
+        }
+
+        public void CompleteStep(string id)
+        {
+            foreach (var step in _steps)
+                if (step.Id == id) step.Done = true;
+        }
+
+        /// <summary>The turn is over (finished, interrupted or failed): nothing it started is still running.</summary>
+        public void CompleteSteps()
+        {
+            foreach (var step in _steps) step.Done = true;
         }
 
         public SessionBrief Snapshot() => new(Prompt, Reply, Model, Branch, Context,
             Tools.Where(t => t.Key is not ("AskUserQuestion" or "ExitPlanMode")) // those two are the question / plan themselves
-                .OrderByDescending(t => t.Value).Take(5).Select(t => (t.Key, t.Value)).ToArray(), Question, Choices.ToArray(), Plan);
+                .OrderByDescending(t => t.Value).Take(5).Select(t => (t.Key, t.Value)).ToArray(), Question, Choices.ToArray(), Plan,
+            _steps.Select(s => new ProgressStep(s.Tool, s.Detail, s.Done)).ToArray());
     }
 
     public ActivitySnapshot Scan()
@@ -125,7 +160,10 @@ internal sealed partial class ActivityMonitor
 
     // A cancelled send and a closed terminal leave a turn open in the log (nothing is written for either), so the log alone
     // cannot end it. Claude Code's session registry (~/.claude/sessions/<pid>.json) can: it holds the live status and the pid.
-    private static readonly TimeSpan SettleTime = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan SettleTime = TimeSpan.FromSeconds(3), ReplacedQuiet = TimeSpan.FromSeconds(20);
+
+    private static bool SameFolder(string? a, string b) =>
+        a is not null && string.Equals(a.TrimEnd('\\', '/'), b.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
 
     private void CloseEndedTurns()
     {
@@ -136,17 +174,22 @@ internal sealed partial class ActivityMonitor
             if (tracked is not { Skip: false, Kind: AgentKind.Claude, State: { } state }) continue;
             var found = registry.TryGetValue(System.IO.Path.GetFileNameWithoutExtension(tracked.Path), out var entry);
             if (found) tracked.Registered = true;
-            if (!state.Running || (!found && !tracked.Registered)) continue; // logs of older versions or the SDK have no entry: the log decides
+            if (!state.Running) continue;
+            // Logs of older versions or the SDK have no entry: the log decides. Except that /clear and /resume swap the session id inside
+            // a live process: the old log keeps its open turn for good, and the registry names the new session in the same folder.
+            if (!found && !tracked.Registered && !(state.Cwd is { } folder && DateTime.UtcNow - tracked.LastWriteUtc > ReplacedQuiet && registry.Values.Any(e => e.Alive && SameFolder(e.Cwd, folder))))
+                continue;
             // "idle" is only believed once the log has been quiet for a moment, so a turn that just finished is still reported as finished.
             var ended = !found || !entry.Alive || (entry.Idle && DateTime.UtcNow - tracked.LastWriteUtc > SettleTime);
             if (!ended) continue;
             state.Running = false;
+            state.CompleteSteps();
             state.QuestionId = null;
             state.End = DateTimeOffset.UtcNow;
         }
     }
 
-    private readonly record struct RegistryEntry(bool Alive, bool Idle);
+    private readonly record struct RegistryEntry(bool Alive, bool Idle, string? Cwd);
 
     private static Dictionary<string, RegistryEntry> ClaudeRegistry()
     {
@@ -163,7 +206,7 @@ internal sealed partial class ActivityMonitor
                 var root = doc.RootElement;
                 if (Str(root, "sessionId") is not { } id || !root.TryGetProperty("pid", out var pidNode) || !pidNode.TryGetInt32(out var pid)) continue;
                 long.TryParse(Str(root, "procStart"), out var started);
-                result[id] = new(IsAlive(pid, started), Str(root, "status") == "idle");
+                result[id] = new(IsAlive(pid, started), Str(root, "status") == "idle", Str(root, "cwd"));
             }
             catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
         }
@@ -335,10 +378,12 @@ internal sealed partial class ActivityMonitor
         {
             case UserRecord.ToolResult:
                 if (state.QuestionId is not null && AnswersQuestion(root, state.QuestionId)) state.QuestionId = null;
+                CompleteResults(root, state);
                 Begin(state, time, newTurn: false);
                 return null;
             case UserRecord.Interrupt:
                 state.Running = false;
+                state.CompleteSteps();
                 state.QuestionId = null;
                 state.End = time;
                 return null; // an interrupted turn is not a completion
@@ -389,7 +434,10 @@ internal sealed partial class ActivityMonitor
                     var name = Str(block, "name");
                     if (name is null) break;
                     state.Tools[name] = state.Tools.GetValueOrDefault(name) + 1;
-                    if (!block.TryGetProperty("input", out var input) || input.ValueKind != JsonValueKind.Object) break;
+                    var hasInput = block.TryGetProperty("input", out var input) && input.ValueKind == JsonValueKind.Object;
+                    if (name is not ("AskUserQuestion" or "ExitPlanMode")) // the question and the plan have their own notices
+                        state.AddStep(Str(block, "id"), name, hasInput ? StepDetail(name, input) : null);
+                    if (!hasInput) break;
                     if (name == "ExitPlanMode") state.Plan = Clean(Str(input, "plan")?.Replace("\n", " / "), 400);
                     else if (name == "AskUserQuestion" && input.TryGetProperty("questions", out var questions) && questions.ValueKind == JsonValueKind.Array)
                         foreach (var question in questions.EnumerateArray())
@@ -436,6 +484,38 @@ internal sealed partial class ActivityMonitor
         return text;
     }
 
+    /// <summary>Marks the tool calls this record answers as finished; parallel calls come back in one record.</summary>
+    private static void CompleteResults(JsonElement root, TurnState state)
+    {
+        if (!root.TryGetProperty("message", out var message) || !message.TryGetProperty("content", out var content) ||
+            content.ValueKind != JsonValueKind.Array) return;
+        foreach (var block in content.EnumerateArray())
+            if (Str(block, "type") == "tool_result" && Str(block, "tool_use_id") is { } id) state.CompleteStep(id);
+    }
+
+    /// <summary>What a tool call was asked to do, in a few words: the command, the file's name, the pattern. Null when the input says nothing useful.</summary>
+    private static string? StepDetail(string tool, JsonElement input)
+    {
+        if (tool.StartsWith("mcp__", StringComparison.Ordinal)) return null; // the name says it, and the arguments vary
+        var text = tool switch
+        {
+            "Bash" or "PowerShell" or "shell" or "exec_command" or "local_shell" => Str(input, "command") ?? Str(input, "cmd") ?? CommandArray(input),
+            "Read" or "Edit" or "Write" or "MultiEdit" or "NotebookEdit" => Str(input, "file_path") is { } path ? Path.GetFileName(path) : null,
+            "Glob" or "Grep" => Str(input, "pattern"),
+            "WebSearch" => Str(input, "query"),
+            "WebFetch" => Uri.TryCreate(Str(input, "url"), UriKind.Absolute, out var uri) ? uri.Host : null,
+            "Task" or "Agent" => Str(input, "description"),
+            "Skill" => Str(input, "skill"),
+            _ => Str(input, "description")
+        };
+        return Clean(text?.Split('\n', 2)[0], 120);
+    }
+
+    /// <summary>Codex logs a command as an array of words (<c>["bash", "-lc", "ls"]</c>); the last one is what was typed.</summary>
+    private static string? CommandArray(JsonElement input) =>
+        input.ValueKind == JsonValueKind.Object && input.TryGetProperty("command", out var command) && command.ValueKind == JsonValueKind.Array
+            ? command.EnumerateArray().Select(word => word.GetString()).LastOrDefault(word => !string.IsNullOrWhiteSpace(word)) : null;
+
     private static bool AnswersQuestion(JsonElement root, string id)
     {
         if (!root.TryGetProperty("message", out var message) || !message.TryGetProperty("content", out var content) ||
@@ -456,6 +536,7 @@ internal sealed partial class ActivityMonitor
     private static Finished? End(TurnState state, DateTimeOffset time)
     {
         state.QuestionId = null;
+        state.CompleteSteps();
         var finished = state.Running ? new Finished(state.Start, time) : (Finished?)null;
         state.Running = false;
         state.End = time;
@@ -481,7 +562,7 @@ internal sealed partial class ActivityMonitor
                 {
                     var blockText = Str(block, "text");
                     if (blockText?.StartsWith("[Request interrupted", StringComparison.Ordinal) == true) return UserRecord.Interrupt;
-                    text ??= blockText;
+                    if (blockText?.StartsWith("[Image", StringComparison.Ordinal) != true) text ??= blockText; // an attached picture's caption is not the message
                 }
             }
         if (toolResult) return UserRecord.ToolResult;
@@ -511,7 +592,11 @@ internal sealed partial class ActivityMonitor
         if (doc is null || !doc.RootElement.TryGetProperty("payload", out var payload)) return;
         if (call)
         {
-            if (Str(payload, "name") is { Length: > 0 } name) state.Tools[name] = state.Tools.GetValueOrDefault(name) + 1;
+            if (Str(payload, "name") is { Length: > 0 } name)
+            {
+                state.Tools[name] = state.Tools.GetValueOrDefault(name) + 1;
+                if (name != "request_user_input") state.AddStep(Str(payload, "call_id"), name, CodexStepDetail(name, payload));
+            }
         }
         else if (context)
         {
@@ -536,10 +621,34 @@ internal sealed partial class ActivityMonitor
         }
     }
 
+    /// <summary>A Codex call carries its arguments as a JSON string.</summary>
+    private static string? CodexStepDetail(string name, JsonElement payload)
+    {
+        if (Str(payload, "arguments") is not { Length: > 0 } arguments) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(arguments);
+            return StepDetail(name, doc.RootElement);
+        }
+        catch (JsonException) { return null; }
+    }
+
+    /// <summary>The id after <c>"call_id":"</c>, found without parsing the (possibly huge) line.</summary>
+    private static string? CallIdOf(ReadOnlySpan<byte> span)
+    {
+        var key = "\"call_id\":\""u8;
+        var at = span.IndexOf(key);
+        if (at < 0) return null;
+        var rest = span[(at + key.Length)..];
+        var end = rest.IndexOf((byte)'"');
+        return end < 0 ? null : Encoding.UTF8.GetString(rest[..end]);
+    }
+
     private static Finished? FeedCodex(ReadOnlyMemory<byte> line, TurnState state)
     {
         var span = line.Span;
         ReadCodexBrief(line, state);
+        if (span.IndexOf("\"type\":\"function_call_output\""u8) >= 0 && CallIdOf(span) is { } answered) state.CompleteStep(answered);
         if (span.IndexOf("\"type\":\"function_call\""u8) >= 0 && span.IndexOf("\"name\":\"request_user_input"u8) >= 0)
         {
             using var call = TryParse(line);
@@ -578,11 +687,13 @@ internal sealed partial class ActivityMonitor
                     ? DateTimeOffset.FromUnixTimeSeconds(seconds) : state.Start;
                 var result = state.Running ? new Finished(begin, time) : (Finished?)null;
                 state.QuestionId = null;
+                state.CompleteSteps();
                 state.Running = false;
                 state.End = time;
                 return result;
             case "turn_aborted":
                 state.QuestionId = null;
+                state.CompleteSteps();
                 state.Running = false;
                 state.End = time;
                 return null;

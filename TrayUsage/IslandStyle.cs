@@ -12,6 +12,10 @@ internal static class Agent
 
 internal static class TimeText
 {
+    /// <summary>"Resets 14:30" for a reset today, "Resets 10/31 14:30" for a later day.</summary>
+    public static string ResetAt(DateTimeOffset time) =>
+        time.Date == DateTime.Today ? $"Resets {time:HH:mm}" : $"Resets {time:M/d HH:mm}";
+
     public static string Elapsed(TimeSpan span)
     {
         if (span < TimeSpan.Zero) span = TimeSpan.Zero;
@@ -183,18 +187,26 @@ internal sealed class IslandStyle : IDisposable
     /// Outline of an island that hangs from the top screen edge: flat top, rounded bottom corners, and a concave
     /// flare ("shoulder") where each side meets the edge. Open (no top line) when <paramref name="closed"/> is false.
     /// </summary>
-    public static GraphicsPath DockedPath(RectangleF body, float radius, float shoulder, bool closed = true)
+    public static GraphicsPath DockedPath(RectangleF body, float radius, float shoulder, bool closed = true, float topRadius = 0)
     {
         var path = new GraphicsPath();
         radius = Math.Clamp(radius, 0, Math.Min(body.Width / 2, Math.Max(0, body.Height - shoulder)));
+        topRadius = Math.Clamp(topRadius, 0, Math.Min(body.Width / 2, body.Height / 2));
         var withShoulder = shoulder >= 0.5f;
+        var withTop = topRadius >= 0.5f && !withShoulder; // the shoulders and the rounded top never coexist: one melts away before the other grows
         if (withShoulder) path.AddArc(body.Left - 2 * shoulder, body.Top, 2 * shoulder, 2 * shoulder, 270, 90);
-        path.AddLine(body.Left, body.Top + (withShoulder ? shoulder : 0), body.Left, body.Bottom - radius);
+        path.AddLine(body.Left, body.Top + (withShoulder ? shoulder : withTop ? topRadius : 0), body.Left, body.Bottom - radius);
         if (radius >= 0.5f) path.AddArc(body.Left, body.Bottom - 2 * radius, 2 * radius, 2 * radius, 180, -90);
         path.AddLine(body.Left + radius, body.Bottom, body.Right - radius, body.Bottom);
         if (radius >= 0.5f) path.AddArc(body.Right - 2 * radius, body.Bottom - 2 * radius, 2 * radius, 2 * radius, 90, -90);
-        path.AddLine(body.Right, body.Bottom - radius, body.Right, body.Top + (withShoulder ? shoulder : 0));
+        path.AddLine(body.Right, body.Bottom - radius, body.Right, body.Top + (withShoulder ? shoulder : withTop ? topRadius : 0));
         if (withShoulder) path.AddArc(body.Right, body.Top, 2 * shoulder, 2 * shoulder, 180, 90);
+        else if (withTop)
+        {
+            path.AddArc(body.Right - 2 * topRadius, body.Top, 2 * topRadius, 2 * topRadius, 0, -90);
+            path.AddLine(body.Right - topRadius, body.Top, body.Left + topRadius, body.Top);
+            path.AddArc(body.Left, body.Top, 2 * topRadius, 2 * topRadius, 270, -90);
+        }
         else path.AddLine(body.Right, body.Top, body.Left, body.Top);
         if (closed) path.CloseFigure();
         return path;

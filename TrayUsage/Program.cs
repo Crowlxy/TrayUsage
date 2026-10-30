@@ -121,11 +121,19 @@ internal sealed class UsageContext : ApplicationContext
         _island.SettingsProvider = SettingRows;
         _island.SettingChanged += OnIslandSetting;
         _island.NoticeClicked += OnNoticeClicked;
+        _island.PillClicked += ShowPreview;
         _island.DetailLeft += () => { if (_detail is not null) FinishAlert(); }; // a card goes away when the pointer does
+        _island.MoreRequested += ShowMore; // the card's "more" button: the Done / History / Settings panel takes its place
         _island.SessionRequested += target => { if (!SessionJump.Activate(target)) ShowPreview(); };
         _island.Hidden += () => GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
         _holdTimer.Tick += (_, _) => { _holdTimer.Stop(); _previewTimer.Stop(); ShowUsage(); RefreshIfStale(); };
-        _previewTimer.Tick += (_, _) => { _previewTimer.Stop(); _previewTimer.Interval = 5000; EndUsage(); };
+        _previewTimer.Tick += (_, _) =>
+        {
+            if (_hover.PointerOnIsland) return; // in use: it goes with the pointer (HoverTrigger), not with the timer
+            _previewTimer.Stop();
+            _previewTimer.Interval = 5000;
+            EndUsage();
+        };
         _activityTimer.Tick += async (_, _) => await ScanActivityAsync();
         _spinTimer.Tick += (_, _) => UpdateActivityIsland();
         try { HookInstaller.RepairIfStale(); }
@@ -158,26 +166,34 @@ internal sealed class UsageContext : ApplicationContext
         if (Environment.GetCommandLineArgs().Contains("--demo")) StartDemo();
     }
 
+    // The sessions --demo shows as running, so the card's pager has pages to turn.
+    private List<NoticeData>? _demoSessions;
+
     /// <summary>--demo: cycles through sample notices (like Agent HUD's demo flag) to preview every kind without real events.</summary>
-    private static SessionTarget Here(AgentKind kind) => new(kind, Environment.CurrentDirectory, null);
+    private static SessionTarget Demo(AgentKind kind, string id) => new(kind, Environment.CurrentDirectory, $"demo-{id}");
 
     private void StartDemo()
     {
-        var claude = Here(AgentKind.Claude);
-        var codex = Here(AgentKind.Codex);
+        var claude = Demo(AgentKind.Claude, "claude");
+        var claudeDone = Demo(AgentKind.Claude, "claude-done"); // a finished turn is a page of its own, apart from the running one
+        var codex = Demo(AgentKind.Codex, "codex");
         var now = DateTime.Now.ToString("HH:mm");
         const string reply = "Added the format check to LoginForm and three tests; all pass.";
         NoticeData[] samples =
         [
             new(AgentKind.Claude, NoticeType.Running, "Claude Code", "Context · Running", "0:42", claude,
-                FiguresOf(new("Fix the email check on the login form", "Reading LoginForm.tsx and the existing tests.", "claude-sonnet-5-5", "main", 64000,
-                    [("Read", 5), ("Grep", 2), ("Edit", 1)], null, [], null), claude, ("Running", "0:42"))),
-            new(AgentKind.Claude, NoticeType.Completed, "Claude Code finished", "Context", "2:14", claude,
+                FiguresOf(new("Fix the email check on the login form", "ログインフォームとテストを読んで、メールの検証を直します。", "claude-sonnet-5-5", "main", 64000,
+                    [("Read", 5), ("Grep", 2), ("Edit", 1)], null, [], null,
+                    [new("Bash", "git status", true), new("Read", "LoginForm.tsx", true), new("Grep", "validateEmail", true), new("Edit", "LoginForm.tsx", false)]),
+                    claude, ("Running", "0:42"))),
+            new(AgentKind.Claude, NoticeType.Completed, "Claude Code finished", "Context", "2:14", claudeDone,
                 FiguresOf(new("Fix the email check on the login form and add tests", reply, "claude-sonnet-5-5", "main", 122000,
-                    [("Bash", 6), ("Edit", 3), ("Read", 4)], null, [], null), claude, ("Took", "2:14"), ("Finished", now))),
-            new(AgentKind.Claude, NoticeType.Completed, "Claude Code finished a long task", "Context", "12:08", claude,
+                    [("Bash", 6), ("Edit", 3), ("Read", 4)], null, [], null,
+                    [new("Read", "LoginForm.tsx", true), new("Edit", "LoginForm.tsx", true), new("Edit", "LoginForm.test.tsx", true),
+                        new("Bash", "npm test -- LoginForm", true)]), claudeDone, ("Took", "2:14"), ("Finished", now))),
+            new(AgentKind.Claude, NoticeType.Completed, "Claude Code finished a long task", "Context", "12:08", claudeDone,
                 FiguresOf(new("Migrate the settings page to the new form components", "Moved all eleven settings rows; the old components are removed.", "claude-sonnet-5-5", "refactor/settings", 168000,
-                    [("Edit", 14), ("Bash", 9), ("Read", 11)], null, [], null), claude, ("Took", "12:08"), ("Finished", now))),
+                    [("Edit", 14), ("Bash", 9), ("Read", 11)], null, [], null), claudeDone, ("Took", "12:08"), ("Finished", now))),
             AskedNotice(new(AgentKind.Codex, "Context", DateTimeOffset.Now, codex, AskReason.Question,
                 new("Pick a validation library", null, "gpt-6", "main", 31000, [("shell", 2)], "Which library should validate the form?", ["zod", "yup", "Write our own"], null))),
             AskedNotice(new(AgentKind.Claude, "Context", DateTimeOffset.Now, claude, AskReason.Plan,
@@ -194,6 +210,14 @@ internal sealed class UsageContext : ApplicationContext
                 new("Keep going on the refactor", "5-hour limit reached · resets 3pm", "claude-sonnet-5-5", "main", 140000, [("Edit", 2)], null, [], null))),
             new(AgentKind.Claude, NoticeType.Reset, "Claude Code 5-hour limit reset", "Usage 92% → 0%", "0%", Card: new(Percent: 0, Footer: "Was 92%"))
         ];
+        _demoSessions =
+        [
+            samples[0],
+            new(AgentKind.Codex, NoticeType.Running, "Codex", "Context · Running", "1:05", codex,
+                FiguresOf(new("Build the release", "swift build で、リリース設定のビルドを確認します。", "gpt-6", "main", 31000, [("shell", 2)], null, [], null,
+                    [new("exec_command", "swift package resolve", true), new("exec_command", "swift build --configuration release", false)]),
+                    codex, ("Running", "1:05")))
+        ];
         // One notice every 7 s, each shown for 6.5 s; click one to open its card (the card holds the queue until it closes).
         var next = 0;
         var timer = new System.Windows.Forms.Timer { Interval = 7000 };
@@ -205,6 +229,7 @@ internal sealed class UsageContext : ApplicationContext
     private async void RefreshOnFirstIdle(object? sender, EventArgs e)
     {
         Application.Idle -= RefreshOnFirstIdle;
+        UpdateActivityIsland();
         await RefreshAsync();
     }
 
@@ -214,6 +239,7 @@ internal sealed class UsageContext : ApplicationContext
         _detail = null;
         _usageShown = true;
         _hover.PanelOpenedByHover = byHover;
+        _island.SetSessions(SessionPages());
         _island.ShowPanel(screen);
     }
 
@@ -221,6 +247,7 @@ internal sealed class UsageContext : ApplicationContext
     private void EndUsage()
     {
         _usageShown = false;
+        _previewTimer.Stop();
         _hover.PanelOpenedByHover = false;
         if (!UpdateActivityIsland()) _island.Dismiss();
     }
@@ -317,6 +344,7 @@ internal sealed class UsageContext : ApplicationContext
         }
         UpdateActivityMenu();
         ApplyAppearance();
+        UpdateActivityIsland(); // the Pill theme keeps a resting capsule up; the Classic one has none
     }
 
     private void ToggleActivity(string name)
@@ -352,11 +380,15 @@ internal sealed class UsageContext : ApplicationContext
             if (_disposed) return;
             // Only a big read is collected right away; a forced collection on every scan would stall the animation.
             if (snapshot.ReadLarge) GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            var absorbed = UpdateProgressCard(snapshot);
             _running = snapshot.Running;
             foreach (var turn in snapshot.Completed) _recent.Insert(0, turn);
             if (_recent.Count > 5) _recent.RemoveRange(5, _recent.Count - 5);
-            _island.SetActivity(_running, _recent);
-            if (notify && snapshot.Completed.Count > 0) PostAlert(DoneNotice(snapshot.Completed[^1]), snapshot.Completed[^1].Duration >= LongTurn ? 9000 : 4500);
+            _island.SetActivity(_recent);
+            _island.SetSessions(SessionPages());
+            // A turn that finished under an open progress card was shown by that card; it needs no notice of its own.
+            var announce = snapshot.Completed.Where(turn => !ReferenceEquals(turn, absorbed)).ToList();
+            if (notify && announce.Count > 0) PostAlert(DoneNotice(announce[^1]), announce[^1].Duration >= LongTurn ? 9000 : 4500);
             if (question)
                 foreach (var asked in snapshot.Asked)
                     PostAlert(AskedNotice(asked), 8000);
@@ -370,6 +402,47 @@ internal sealed class UsageContext : ApplicationContext
         {
             _scanning = false;
         }
+    }
+
+    /// <summary>
+    /// What the card pages through: a page per running session, in the order they started. The notice whose card is open stays a
+    /// page after its turn is over (and for a demo notice, which no log backs); with nothing else, the latest finished turn is the page.
+    /// </summary>
+    private List<NoticeData> SessionPages()
+    {
+        var pages = _running.Select(session => RunningNotice([session])).ToList();
+        if (_demoSessions is not null) pages.AddRange(_demoSessions);
+        if (_detail is { Type: NoticeType.Running or NoticeType.Completed } open &&
+            !pages.Any(page => ProgressSurface.KeyOf(page) == ProgressSurface.KeyOf(open)))
+            pages.Add(open);
+        else if (pages.Count == 0 && _recent.Count > 0) pages.Add(DoneNotice(_recent[0]));
+        return pages;
+    }
+
+    /// <summary>
+    /// Keeps the notice behind an open card in step with its session: when its turn ends the card turns into the finished one (the page
+    /// follows by session id, see <see cref="SessionPages"/>). A turn that was cancelled or whose terminal was closed has nothing left
+    /// to show, so the card goes.
+    /// </summary>
+    /// <returns>The finished turn the card took over, or null.</returns>
+    private CompletedTurn? UpdateProgressCard(ActivitySnapshot snapshot)
+    {
+        if (_demoSessions is not null || _detail is not { Type: NoticeType.Running } open || open.Target?.SessionId is not { } id) return null;
+        if (snapshot.Running.FirstOrDefault(session => session.Target?.SessionId == id) is { } running)
+        {
+            _detail = RunningNotice([running]);
+            return null;
+        }
+        if (snapshot.Completed.LastOrDefault(turn => turn.Target?.SessionId == id) is { } finished)
+        {
+            _detail = DoneNotice(finished);
+            _doneTimer.Stop();
+            _doneTimer.Interval = 8000;
+            _doneTimer.Start();
+            return finished;
+        }
+        FinishAlert();
+        return null;
     }
 
     /// <summary>Shows the finished notice or the running capsule. Returns false when there is nothing to show.</summary>
@@ -395,9 +468,16 @@ internal sealed class UsageContext : ApplicationContext
             return true;
         }
         _spinTimer.Stop();
+        if (PillTheme)
+        {
+            _island.ShowIdle(); // the Pill theme keeps its resting capsule up, with the usage ring in it
+            return true;
+        }
         if (_island.Visible && _island.Mode == IslandMode.Notice) _island.Dismiss();
         return false;
     }
+
+    private static bool PillTheme => ActivitySettings.GetInt(ActivitySettings.Theme, 0) == (int)IslandTheme.Pill;
 
     private static NoticeData RunningNotice(IReadOnlyList<AgentSession> running)
     {
@@ -450,7 +530,7 @@ internal sealed class UsageContext : ApplicationContext
 
     /// <summary>The figures-only card (completions, running sessions, approvals): no first screen.</summary>
     private static NoticeCard FiguresOf(SessionBrief? brief, SessionTarget? target, params (string Label, string Value)[] facts) =>
-        CardOf(brief, null, target, facts) with { Task = null, Choices = null };
+        CardOf(brief, null, target, facts) with { Task = null, Choices = null, Steps = brief?.Steps, Prompt = brief?.Prompt, Reply = brief?.Reply };
 
     /// <summary>The numbered steps of a plan, as the log collector joined them (" / "), without their own numbers.</summary>
     private static IReadOnlyList<string>? PlanSteps(string? plan) => plan?.Split(" / ", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -491,6 +571,7 @@ internal sealed class UsageContext : ApplicationContext
         }
         if (_island.CurrentNotice is not { } notice) return;
         _detail = notice;
+        _island.SetSessions(SessionPages());
         _island.ShowDetail(notice);
         _doneTimer.Stop();
         _doneTimer.Interval = 15000;
@@ -546,17 +627,36 @@ internal sealed class UsageContext : ApplicationContext
         _detail = null;
         _usageShown = true;
         _island.ShowSettings();
+        _hover.PanelOpenedByHover = true; // like every menu not held open by Caps Lock, it goes when the pointer leaves it
+        _hover.AwaitPointer();
         RefreshIfStale();
         _previewTimer.Stop();
         _previewTimer.Interval = 20000;
         _previewTimer.Start();
     }
 
+    /// <summary>
+    /// The card's "more" button: the Done / History / Settings panel. The pointer is on the island when it is pressed, so the panel
+    /// goes when the pointer leaves it, as a hover-opened one does; no timer closes it while it is in use.
+    /// </summary>
+    private void ShowMore()
+    {
+        _holdTimer.Stop();
+        _previewTimer.Stop();
+        _detail = null;
+        _doneTimer.Stop();
+        _alertNotice = null;
+        _usageShown = true;
+        _hover.PanelOpenedByHover = true;
+        _island.ShowMore();
+    }
+
     private void ShowPreview()
     {
         _previewTimer.Interval = 5000;
         _holdTimer.Stop();
-        ShowUsage();
+        ShowUsage(byHover: true); // the same mouse-out close as a hover-opened menu, once the pointer has been on it
+        _hover.AwaitPointer();
         RefreshIfStale();
         _previewTimer.Stop();
         _previewTimer.Start();

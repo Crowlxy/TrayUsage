@@ -18,7 +18,7 @@ internal sealed class HoverTrigger : IDisposable
     private Point _anchor;
     private DateTime _anchorAt, _holdUntil;
     private DateTime? _leftAt;
-    private bool _hasAnchor, _fired;
+    private bool _hasAnchor, _fired, _awaiting, _entered;
     private Rectangle[]? _monitors;
 
     public HoverTrigger(UsageIsland island)
@@ -39,6 +39,12 @@ internal sealed class HoverTrigger : IDisposable
     public bool PanelOpenedByHover { get; set; }
 
     public bool PointerOnIsland { get; private set; }
+
+    /// <summary>
+    /// For a panel opened with the pointer somewhere else (the tray icon, the resting pill, the settings): it collapses on mouse-out
+    /// like a hover-opened one, but only once the pointer has been on it, so it does not vanish before the pointer has got there.
+    /// </summary>
+    public void AwaitPointer() => (_awaiting, _entered) = (true, false);
 
     /// <summary>Opening by hover can be switched off; the panel then opens only from Caps Lock or the tray icon.</summary>
     public bool Enabled { get; set; } = true;
@@ -72,16 +78,18 @@ internal sealed class HoverTrigger : IDisposable
         }
         PointerOnIsland = onIsland;
         _island.SetPointerOver(onIsland);
+        _entered |= onIsland;
 
         if (PanelOpenedByHover)
         {
-            if (onIsland || buttonDown) _leftAt = null;
+            if (onIsland || buttonDown || (_awaiting && !_entered)) _leftAt = null;
             else
             {
                 _leftAt ??= now;
                 if ((now - _leftAt.Value).TotalSeconds >= CollapseSeconds && now >= _holdUntil)
                 {
                     PanelOpenedByHover = false;
+                    _awaiting = false;
                     _leftAt = null;
                     Left?.Invoke();
                 }
@@ -106,6 +114,7 @@ internal sealed class HoverTrigger : IDisposable
         if ((now - _anchorAt).TotalSeconds < DwellSeconds) return;
         _fired = true;
         _hasAnchor = false;
+        _awaiting = false;
         Opened?.Invoke(Screen.FromPoint(p));
     }
 
